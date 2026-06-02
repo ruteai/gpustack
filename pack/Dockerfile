@@ -300,6 +300,8 @@ SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 ARG TARGETPLATFORM
 ARG TARGETOS
 ARG TARGETARCH
+ARG UI_REPO
+ARG UI_BRANCH
 
 ## Configure data volume
 VOLUME /var/lib/gpustack
@@ -487,9 +489,28 @@ RUN <<EOF
         && rm -rf /var/cache/apt
 EOF
 
+## Install Node.js (required when building UI from source)
+
+ARG UI_REPO
+RUN <<EOF
+    if [[ -n "${UI_REPO}" ]]; then
+        apt-get update -y && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+            && mkdir -p /etc/apt/keyrings \
+            && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+            && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list \
+            && apt-get update -y && apt-get install -y --no-install-recommends nodejs \
+            && npm install -g pnpm@9 \
+            && rm -rf /var/tmp/* && rm -rf /tmp/* && rm -rf /var/cache/apt
+        node --version
+        pnpm --version
+    fi
+EOF
+
 ## Install GPUStack
 
 ARG UI_DOWNLOAD=true
+ARG UI_REPO
+ARG UI_BRANCH
 
 RUN --mount=type=cache,target=/root/.cache \
     --mount=type=bind,target=/workspace/gpustack,rw <<EOF
@@ -500,6 +521,8 @@ RUN --mount=type=cache,target=/root/.cache \
     export UV_SYSTEM_PYTHON=1
     export UV_LINK_MODE=copy
     export UI_DOWNLOAD=${UI_DOWNLOAD}
+    export UI_REPO=${UI_REPO}
+    export UI_BRANCH=${UI_BRANCH}
 
     # Build GPUStack
     cd /workspace/gpustack \

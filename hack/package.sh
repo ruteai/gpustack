@@ -58,8 +58,10 @@ function pack() {
         --ulimit nofile=65536:65536 \
         --shm-size 16G \
         --progress plain \
-        --build-arg "GPUSTACK_RUNTIME_DOCKER_MIRRORED_NAME_FILTER_LABELS=$(printf "%s;" "${LABELS[@]}")" \
+        --build-arg "GPUSTACK_RUNTIME_DOCKER_MIRRORED_NAME_FILTER_LABELS=$(printf "%s;" "${LABELS[@]}" )" \
         --build-arg "UI_DOWNLOAD=${PACKAGE_UI_DOWNLOAD}" \
+        --build-arg "UI_REPO=${UI_REPO:-}" \
+        --build-arg "UI_BRANCH=${UI_BRANCH:-}" \
         "${EXTRA_ARGS[@]}" \
         "${ROOT_DIR}"
     set +x

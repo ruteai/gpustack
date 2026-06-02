@@ -29,16 +29,43 @@ function download_ui() {
     return
   fi
 
-  local default_tag="latest"
   local ui_path="${ROOT_DIR}/gpustack/ui"
   local tmp_ui_path="${ui_path}/tmp"
+
+  rm -rf "${ui_path}"
+  mkdir -p "${tmp_ui_path}"
+
+  # Build UI from custom repository if UI_REPO is set
+  if [[ -n "${UI_REPO:-}" ]]; then
+    local ui_branch="${UI_BRANCH:-main}"
+    gpustack::log::info "building UI from ${UI_REPO} branch=${ui_branch}"
+
+    git clone --depth 1 --branch "${ui_branch}" "${UI_REPO}" "${tmp_ui_path}/gpustack-ui"
+    (
+      cd "${tmp_ui_path}/gpustack-ui"
+      if ! command -v node &> /dev/null; then
+        gpustack::log::fatal "node is required to build UI from source, please install Node.js"
+      fi
+      if ! command -v pnpm &> /dev/null; then
+        gpustack::log::warn "pnpm not found, installing pnpm@9"
+        npm install -g pnpm@9
+      fi
+      pnpm install --frozen-lockfile 2>/dev/null || pnpm install
+      pnpm run build
+    )
+    mkdir -p "${ui_path}"
+    cp -a "${tmp_ui_path}/gpustack-ui/dist/." "${ui_path}"
+    rm -rf "${tmp_ui_path}"
+    return
+  fi
+
+  local default_tag="latest"
   local tag="latest"
 
   if [[ "${GIT_VERSION}" != "v0.0.0" ]]; then
     tag="${GIT_VERSION}"
   fi
 
-  rm -rf "${ui_path}"
   mkdir -p "${tmp_ui_path}/ui"
 
   gpustack::log::info "downloading '${tag}' UI assets"
