@@ -6,7 +6,7 @@ authors = [{name = "GPUStack Authors", email = "contact@gpustack.ai"}]
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "fastapi>=0.115.0",
+    "fastapi>=0.115.0,<0.137.0",
     "sqlmodel>=0.0.18",
     "pydantic>=2.11.5",
     "pydantic-settings>=2.2.1",
@@ -64,9 +64,9 @@ dependencies = [
     "kubernetes-asyncio>=33.1.0,<34.0.0",
     "msgpack>=1.1.2",
     "cachetools>=6.0.0",
-    "gpustack-runner==0.1.26.post2",
-    "gpustack-runtime==0.2.0.post2",
-    "gpustack-higress-plugins==0.2.3.post2",
+    "gpustack-runner==0.1.26.post5",
+    "gpustack-runtime==0.2.0.post5",
+    "gpustack-higress-plugins==0.2.3.post5",
     "websockets==16.0",
     "py-radix>=1.1.0",
 ]

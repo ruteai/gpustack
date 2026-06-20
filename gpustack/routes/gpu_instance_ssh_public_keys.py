@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends
 from starlette.responses import StreamingResponse
 
 from gpustack.api.exceptions import (
+    AlreadyExistsException,
     InternalServerErrorException,
     NotFoundException,
 )
@@ -103,12 +104,26 @@ async def create_gpu_instance_ssh_public_key(
 
     _validate_create_obj(create_obj)
 
+    existed = await GPUInstanceSSHPublicKey.exist_by_fields(
+        session=session,
+        fields={
+            "owner_principal_id": create_obj.owner_principal_id,
+            "name": create_obj.name,
+        },
+    )
+    if existed:
+        raise AlreadyExistsException(
+            message=(f"SSH public key with name '{create_obj.name}' already exists."),
+        )
+
+    source: dict = create_obj.model_dump()
+    source["creator_id"] = ctx.user.id
     async with handle_error(
         message="Failed to create GPU instance SSH public key",
     ):
         return await GPUInstanceSSHPublicKey.create(
             session=session,
-            source=create_obj,
+            source=source,
         )
 
 

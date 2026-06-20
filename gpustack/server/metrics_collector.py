@@ -3,7 +3,6 @@ import logging
 import time
 from datetime import date, datetime, timezone, tzinfo
 from typing import Dict, List, Optional, Set, Tuple
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel
 from sqlmodel import or_
@@ -19,6 +18,7 @@ from gpustack.schemas.model_usage_details import ModelUsageDetails
 from gpustack.schemas.models import Model, is_embedding_model, is_reranker_model
 from gpustack.schemas.principals import Principal
 from gpustack.server.db import async_session
+from gpustack.utils.rollup_tz import resolve_rollup_tz
 from gpustack.utils.usage_snapshots import build_model_usage_snapshot
 
 logger = logging.getLogger(__name__)
@@ -35,8 +35,8 @@ FLUSH_INTERVAL_SECONDS = 10
 # ``operation`` and ``date`` are part of the key so per-operation rollups
 # stay separate and a stream that crosses midnight lands in the period
 # it ends in (anchored on completed_at). ``date`` is computed in the
-# configured rollup timezone (see ``_resolve_rollup_tz``), not UTC, so
-# midnight here means local-calendar midnight.
+# configured rollup timezone (see ``_ROLLUP_TZ``), not UTC, so midnight here
+# means local-calendar midnight.
 gateway_metrics_buffer: Dict[str, "ModelUsageMetrics"] = {}
 # Raw per-report metrics retained for ``model_usage_details`` audit rows.
 # Unlike ``gateway_metrics_buffer``, entries are not aggregated.
@@ -107,31 +107,11 @@ def _unixmilli_to_naive_utc(ms: Optional[int]) -> Optional[datetime]:
     return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).replace(tzinfo=None)
 
 
-def _resolve_rollup_tz() -> tzinfo:
-    """Resolve the timezone used to bucket the daily ``model_usages.date`` rollup.
-
-    Priority:
-      1. ``GPUSTACK_USAGE_ROLLUP_TIMEZONE`` env (IANA name, e.g. ``Asia/Shanghai``).
-      2. Operating system local timezone (``TZ`` env / ``/etc/localtime``).
-    Falls back to UTC if the OS lookup somehow yields no tzinfo.
-    """
-    tz_name = envs.USAGE_ROLLUP_TIMEZONE
-    if tz_name:
-        try:
-            return ZoneInfo(tz_name)
-        except (ZoneInfoNotFoundError, ValueError):
-            # ``ValueError`` covers malformed keys (absolute paths, ``..``
-            # segments) that ``ZoneInfo`` rejects before lookup.
-            logger.warning(
-                "Invalid GPUSTACK_USAGE_ROLLUP_TIMEZONE=%r, falling back to OS local tz",
-                tz_name,
-            )
-    return datetime.now(timezone.utc).astimezone().tzinfo or timezone.utc
-
-
-# Resolved once at import time. Tests can monkeypatch this attribute to pin
-# a deterministic timezone independent of the host's ``TZ``.
-_ROLLUP_TZ: tzinfo = _resolve_rollup_tz()
+# Shared with the metered_usage read API so the daily token rollup and the
+# GPU/storage views share one timezone (see ``gpustack.utils.rollup_tz``).
+# Resolved once at import time; tests monkeypatch this attribute to pin a
+# deterministic timezone independent of the host's ``TZ``.
+_ROLLUP_TZ: tzinfo = resolve_rollup_tz()
 
 
 def _resolve_metric_datetime(
@@ -449,6 +429,7 @@ def _build_metric_snapshot(
     api_key_by_access_key: Dict[str, ApiKey],
     cluster_names_by_id: Dict[int, str],
     route_name_by_id: Dict[int, str],
+    route_owner_by_id: Dict[int, int],
 ) -> dict:
     user = user_by_id.get(metric.user_id)
     api_key = api_key_by_access_key.get(metric.access_key)
@@ -476,6 +457,12 @@ def _build_metric_snapshot(
                     "provider_id": provider.id,
                     "provider_name": provider.name,
                     "provider_type": provider_type,
+                    # MaaS provider targets have no local Model row, so the
+                    # tenant scope can't be sourced from model.owner_principal_id.
+                    # The provider always belongs to one Org (non-NULL owner),
+                    # so it is the authoritative owner for this usage row —
+                    # mirroring the model-path's model.owner_principal_id.
+                    "owner_principal_id": getattr(provider, "owner_principal_id", None),
                 }
             )
         if user is not None:
@@ -498,16 +485,20 @@ def _build_metric_snapshot(
         if model_route_id is not None:
             snapshot["model_route_id"] = model_route_id
             snapshot["model_route_name"] = model_route_name
-        # The "model deleted before flush" branch can no longer source
-        # tenant scope from ``model.owner_principal_id``. Fall back to the
-        # api_key's owner so cross-tenant attribution still works in this
-        # edge case — under the route/target same-Org rule, api_key owner
-        # is necessarily aligned with the route's (and the deleted model's)
-        # Org for any non-platform deployment.
-        if api_key is not None:
-            snapshot["owner_principal_id"] = getattr(
-                api_key, "owner_principal_id", None
-            )
+        # ``owner_principal_id`` is the tenant scope of the *consumed
+        # resource*, not of the caller — the caller's principal is captured
+        # separately as ``consumer_principal_id`` (from api_key.owner above).
+        # So the fallback must NOT reuse api_key.owner here: that conflates
+        # consumer with owner and only coincides under the same-Org rule.
+        #
+        # When the model was deleted before flush (provider also absent),
+        # source the owner from the route, which has a non-NULL owner and
+        # outlives the model. A provider-sourced owner (set above for MaaS
+        # provider targets) is authoritative and must not be overwritten.
+        if snapshot.get("owner_principal_id") is None and model_route_id is not None:
+            route_owner = route_owner_by_id.get(model_route_id)
+            if route_owner is not None:
+                snapshot["owner_principal_id"] = route_owner
     else:
         snapshot = build_model_usage_snapshot(
             model,
@@ -603,6 +594,7 @@ async def store_usage_metrics(
             )
             route_name_by_id: Dict[int, str] = {}
             route_base_model_id_by_id: Dict[int, int] = {}
+            route_owner_by_id: Dict[int, int] = {}
             if dedup_route_ids:
                 routes = await ModelRoute.all_by_fields(
                     session=session,
@@ -614,6 +606,11 @@ async def store_usage_metrics(
                     r.id: r.created_model_id
                     for r in routes
                     if r.created_model_id is not None
+                }
+                route_owner_by_id = {
+                    r.id: r.owner_principal_id
+                    for r in routes
+                    if r.owner_principal_id is not None
                 }
             validated_user_ids = {u.id for u in users}
             user_by_id = {u.id: u for u in users}
@@ -646,6 +643,7 @@ async def store_usage_metrics(
                     api_key_by_access_key,
                     cluster_names_by_id,
                     route_name_by_id,
+                    route_owner_by_id,
                 )
                 prompt_tokens, completion_tokens = _resolve_usage_tokens(
                     metric, model_by_id.get(metric.model_id)
@@ -682,6 +680,7 @@ async def store_usage_metrics(
                     api_key_by_access_key,
                     cluster_names_by_id,
                     route_name_by_id,
+                    route_owner_by_id,
                 )
                 prompt_tokens, completion_tokens = _resolve_usage_tokens(
                     metric, model_by_id.get(metric.model_id)
@@ -706,6 +705,11 @@ async def store_usage_metrics(
                         prompt_token_count=prompt_tokens,
                         completion_token_count=completion_tokens,
                         prompt_cached_token_count=metric.input_cached_token,
+                        # Persist the completion flag so downstream billing
+                        # can tell authoritative token counts from estimated
+                        # ones, and gate per-request charges (image/tts/stt)
+                        # on actual completion.
+                        completed=metric.completed,
                         operation=metric.operation,
                         # Proxy-reported wall-clock — preserved as NULL when
                         # the report didn't carry it, so reconciliation jobs

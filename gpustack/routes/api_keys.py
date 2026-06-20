@@ -55,6 +55,7 @@ def _api_key_to_public(
         user_name=user_name or api_key.user_name,
         value=value,
         masked_value=get_masked_api_key_value(api_key.access_key, api_key.is_custom),
+        owner_principal_id=api_key.owner_principal_id,
         created_at=api_key.created_at,
         updated_at=api_key.updated_at,
         expires_at=api_key.expires_at,
@@ -174,7 +175,9 @@ async def create_api_key(
     }
     existing = await ApiKey.one_by_fields(session, fields)
     if existing:
-        raise AlreadyExistsException(message=f"Api key {key_in.name} already exists")
+        raise AlreadyExistsException(
+            message=f"API key with name '{key_in.name}' already exists."
+        )
 
     if key_in.custom is None:
         access_key, secret_key = secrets.token_hex(8), secrets.token_hex(16)

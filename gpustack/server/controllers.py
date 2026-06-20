@@ -5,7 +5,7 @@ import asyncio
 import yaml
 from importlib.resources import files
 from functools import partial
-from typing import Any, Dict, List, Tuple, Optional, Set
+from typing import Any, Dict, Iterable, List, Tuple, Optional, Set
 from pydantic import BaseModel
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -27,6 +27,7 @@ from gpustack.gpu_instances.cluster_apis_util import (
 )
 from gpustack.schemas.gpu_instances import (
     GPUInstance,
+    GPUInstancePhase,
     GPUInstanceStatus,
 )
 from gpustack.schemas.gpu_instance_persistent_volumes import (
@@ -74,6 +75,7 @@ from gpustack.schemas.models import (
     ModelInstance,
     ModelInstanceCreate,
     ModelInstanceStateEnum,
+    ModelInstanceSubordinateWorker,
     SourceEnum,
     get_backend,
 )
@@ -564,6 +566,7 @@ async def get_or_create_lora_model_files_for_instance(
         return []
     worker_ids = _get_worker_ids_for_file_download(instance)
     base_desc = model_base_descriptor(model)
+    worker_scopes = await _get_worker_tenant_scopes(session, worker_ids)
     out: List[ModelFile] = []
     seen_ids: Set[int] = set()
 
@@ -595,6 +598,9 @@ async def get_or_create_lora_model_files_for_instance(
                     out.append(hit)
                     seen_ids.add(hit.id)
             else:
+                cluster_id, owner_principal_id = worker_scopes.get(
+                    worker_id, (None, None)
+                )
                 nf = ModelFile(
                     source=lora_src.source,
                     huggingface_repo_id=lora_src.huggingface_repo_id,
@@ -607,6 +613,8 @@ async def get_or_create_lora_model_files_for_instance(
                     state=ModelFileStateEnum.DOWNLOADING,
                     worker_id=worker_id,
                     source_index=lora_src.model_source_index,
+                    cluster_id=cluster_id,
+                    owner_principal_id=owner_principal_id,
                 )
                 created = await ModelFile.create(session, nf, auto_commit=False)
                 mf = created or nf
@@ -715,8 +723,10 @@ async def get_or_create_model_files_for_instance(
     model_source = instance
     if is_draft_model:
         model_source = instance.draft_model_source
+    worker_scopes = await _get_worker_tenant_scopes(session, missing_worker_ids)
     # Create model files for the missing worker IDs.
     for worker_id in missing_worker_ids:
+        cluster_id, owner_principal_id = worker_scopes.get(worker_id, (None, None))
         model_file = ModelFile(
             source=model_source.source,
             huggingface_repo_id=model_source.huggingface_repo_id,
@@ -727,6 +737,8 @@ async def get_or_create_model_files_for_instance(
             state=ModelFileStateEnum.DOWNLOADING,
             worker_id=worker_id,
             source_index=model_source.model_source_index,
+            cluster_id=cluster_id,
+            owner_principal_id=owner_principal_id,
         )
         await ModelFile.create(session, model_file, auto_commit=False)
         logger.info(
@@ -1660,6 +1672,8 @@ class InferenceBackendController:
             "description",
             "icon",
             "default_env",
+            "parameter_format",
+            "common_parameters",
         ]
         backend_data = {k: config[k] for k in allowed_keys if k in config}
 
@@ -1846,12 +1860,13 @@ def _aggregate_instance_download_progress(
     override_state: Optional[ModelFileStateEnum] = None,
 ) -> Optional[float]:
     """
-    Average download_progress over not-yet-READY ModelFile rows so the bar
-    tracks active downloads (e.g. just the new LoRA when base is already cached).
-    Returns 100.0 if all files are READY, None if no files. `override_progress`
-    / `override_state` represent a transition not yet persisted to the DB row.
+    Average progress over the main worker's not-yet-READY files. Subordinate
+    files are excluded: instance.download_progress is the main worker's bar (the
+    UI shows subordinate progress separately). 100.0 if all READY, None if none.
+    override_* = a transition not yet persisted to the DB row.
     """
-    files = list(instance.model_files or [])
+    # Main worker only; subordinate progress is tracked per-worker elsewhere.
+    files = [f for f in instance.model_files or [] if f.worker_id == instance.worker_id]
     if not files:
         return None
     active_values: List[float] = []
@@ -1874,30 +1889,154 @@ def _aggregate_instance_download_progress(
     return sum(active_values) / len(active_values)
 
 
-async def sync_main_worker_model_file_state(  # noqa: C901
+def _refresh_instance_download_progress(
+    instance: ModelInstance, file: ModelFile, *, file_ready: bool = False
+) -> bool:
+    """Re-aggregate per-file progress into instance.download_progress (the
+    overall bar). `file_ready` treats `file` as 100%/READY so it drops out of
+    the active set and the bar can reach 100. Returns True if it changed."""
+    if instance.download_progress == 100:
+        return False
+    if file_ready:
+        aggregate = _aggregate_instance_download_progress(
+            instance,
+            file,
+            override_progress=100.0,
+            override_state=ModelFileStateEnum.READY,
+        )
+    else:
+        aggregate = _aggregate_instance_download_progress(instance, file)
+    if aggregate is not None and aggregate != instance.download_progress:
+        instance.download_progress = aggregate
+        return True
+    return False
+
+
+def _first_resolved_path(
+    files: Optional[List[ModelFile]], *, exclude_lora: bool = False
+) -> Optional[str]:
+    """Return the first resolved path among `files`, skipping LoRA files when
+    `exclude_lora` is set. None if no file carries a resolved path."""
+    for file in files or []:
+        if exclude_lora and file.is_lora:
+            continue
+        if file.resolved_paths:
+            return file.resolved_paths[0]
+    return None
+
+
+async def _promote_to_starting_if_complete(
+    session: AsyncSession, instance: ModelInstance
+) -> bool:
+    """When all files are ready, attach the LoRA mount list, backfill the
+    resolved paths, and move to STARTING. Returns True if promoted."""
+    loaded = await ModelInstance.one_by_id_with_model_files(session, instance.id)
+    if not _download_completed(loaded):
+        return False
+    # Promotion is the single choke point into STARTING, so backfill the paths
+    # here: the subordinate path never sets them and concurrent events may carry
+    # a None snapshot, which crashes the worker on Path(None).
+    if not instance.resolved_path:
+        instance.resolved_path = _first_resolved_path(
+            loaded.model_files, exclude_lora=True
+        )
+    if instance.draft_model_source and not instance.draft_model_resolved_path:
+        instance.draft_model_resolved_path = _first_resolved_path(
+            loaded.draft_model_files
+        )
+    mounted, lora_skipped = await _build_mounted_loras_payload(session, instance)
+    if mounted is not None:
+        instance.mounted_loras = mounted
+    instance.state = ModelInstanceStateEnum.STARTING
+    instance.state_message = "; ".join(lora_skipped) if lora_skipped else ""
+    return True
+
+
+def _sync_main_worker_downloading(
+    instance: ModelInstance, file: ModelFile, is_draft_model: bool
+) -> bool:
+    """Handle a main-worker file's DOWNLOADING event. Returns need_update."""
+    # First file to start: flip to DOWNLOADING and seed the bar. Draft seeds 0
+    # (tracked separately); primary/LoRA seeds the active-file aggregate.
+    if instance.state == ModelInstanceStateEnum.INITIALIZING:
+        instance.state = ModelInstanceStateEnum.DOWNLOADING
+        instance.state_message = ""
+        if is_draft_model:
+            instance.download_progress = 0
+        else:
+            aggregate = _aggregate_instance_download_progress(instance, file)
+            instance.download_progress = aggregate if aggregate is not None else 0
+        return True
+
+    if instance.state != ModelInstanceStateEnum.DOWNLOADING:
+        return False
+
+    if is_draft_model:
+        if (
+            file.download_progress != instance.draft_model_download_progress
+            and instance.draft_model_download_progress != 100
+        ):
+            instance.draft_model_download_progress = file.download_progress
+            return True
+        return False
+
+    # Primary/LoRA file: feed the aggregate bar.
+    return _refresh_instance_download_progress(instance, file)
+
+
+async def _sync_main_worker_ready(
+    session: AsyncSession,
+    instance: ModelInstance,
+    file: ModelFile,
+    is_draft_model: bool,
+) -> bool:
+    """Handle a main-worker file's READY event. Returns need_update."""
+    need_update = False
+
+    if is_draft_model:
+        if (
+            instance.draft_model_download_progress != 100
+            or not instance.draft_model_resolved_path
+        ):
+            instance.draft_model_download_progress = 100
+            if file.resolved_paths:
+                instance.draft_model_resolved_path = file.resolved_paths[0]
+            need_update = True
+    else:
+        # Only the primary file owns resolved_path; LoRA files use mounted_loras.
+        if (
+            _is_primary_instance_model_file(file, instance, is_draft_model)
+            and not instance.resolved_path
+        ):
+            if file.resolved_paths:
+                instance.resolved_path = file.resolved_paths[0]
+            need_update = True
+        if _refresh_instance_download_progress(instance, file, file_ready=True):
+            need_update = True
+
+    if await _promote_to_starting_if_complete(session, instance):
+        need_update = True
+    elif instance.state == ModelInstanceStateEnum.INITIALIZING:
+        # Some but not all files done.
+        instance.state = ModelInstanceStateEnum.DOWNLOADING
+        instance.state_message = ""
+        need_update = True
+
+    return need_update
+
+
+async def sync_main_worker_model_file_state(
     session: AsyncSession,
     file: ModelFile,
     instance: ModelInstance,
     is_draft_model: bool = False,
 ):
-    """
-    Sync the model file state to the related model instance.
-    """
+    """Sync a main-worker model file's state onto its model instance."""
 
-    # Re-load instance into this session to avoid identity map conflicts.
-    # The caller (ModelFileController._reconcile) may pass a detached instance
-    # from a closed session.  Later helpers like model_instance_download_completed
-    # load the same row via get_by_id_with_model_files, creating a *different*
-    # persistent object in this session.  session.add(detached_obj) then fails
-    # with InvalidRequestError because the identity map already holds another
-    # object with the same primary key.
-    # Eager-load model_files so progress aggregation can read sibling rows
-    # (base + every LoRA adapter) without an extra round-trip.
+    # Re-load (with model_files) to avoid identity-map conflicts with a detached
+    # instance from the caller, and to let progress aggregation read sibling rows.
     instance = await ModelInstance.one_by_id_with_model_files(session, instance.id)
-    if not instance:
-        return
-
-    if instance.state == ModelInstanceStateEnum.ERROR:
+    if not instance or instance.state == ModelInstanceStateEnum.ERROR:
         return
 
     logger.trace(
@@ -1906,97 +2045,15 @@ async def sync_main_worker_model_file_state(  # noqa: C901
     )
 
     need_update = False
-
-    # Downloading
     if file.state == ModelFileStateEnum.DOWNLOADING:
-        if instance.state == ModelInstanceStateEnum.INITIALIZING:
-            # Download started. Seed instance.download_progress from the
-            # aggregate over the *active* (not-yet-READY) files. When the user
-            # added a new LoRA to a model whose base is already cached, the
-            # active set is just the LoRA, so the bar honestly starts at the
-            # LoRA's current progress (typically 0) rather than reporting a
-            # misleading "50%" from averaging in an already-completed base.
-            instance.state = ModelInstanceStateEnum.DOWNLOADING
-            if is_draft_model:
-                instance.download_progress = 0
-            else:
-                aggregate = _aggregate_instance_download_progress(instance, file)
-                instance.download_progress = aggregate if aggregate is not None else 0
-            instance.state_message = ""
-            need_update = True
-        elif instance.state == ModelInstanceStateEnum.DOWNLOADING:
-            # Update download progress
-            if (
-                is_draft_model
-                and file.download_progress != instance.draft_model_download_progress
-                and instance.draft_model_download_progress != 100
-            ):
-                # For the draft model file
-                instance.draft_model_download_progress = file.download_progress
-                need_update = True
-            elif not is_draft_model and instance.download_progress != 100:
-                # For the primary model file or any LoRA adapter file: aggregate
-                # the per-file progress into a single instance-level percentage.
-                aggregate = _aggregate_instance_download_progress(instance, file)
-                if aggregate is not None and aggregate != instance.download_progress:
-                    instance.download_progress = aggregate
-                    need_update = True
-
-    # Download completed
-    elif file.state == ModelFileStateEnum.READY and (
-        instance.state == ModelInstanceStateEnum.DOWNLOADING
-        or instance.state == ModelInstanceStateEnum.INITIALIZING
+        need_update = _sync_main_worker_downloading(instance, file, is_draft_model)
+    elif file.state == ModelFileStateEnum.READY and instance.state in (
+        ModelInstanceStateEnum.DOWNLOADING,
+        ModelInstanceStateEnum.INITIALIZING,
     ):
-        if is_draft_model and (
-            instance.draft_model_download_progress != 100
-            or not instance.draft_model_resolved_path
-        ):
-            # Download completed for the draft model file
-            instance.draft_model_download_progress = 100
-            instance.draft_model_resolved_path = file.resolved_paths[0]
-            need_update = True
-        elif not is_draft_model:
-            # Only the base (primary) ModelFile owns instance.resolved_path; LoRA
-            # files are surfaced via mounted_loras instead.
-            if (
-                _is_primary_instance_model_file(file, instance, is_draft_model)
-                and not instance.resolved_path
-            ):
-                instance.resolved_path = file.resolved_paths[0]
-                need_update = True
-            # Re-aggregate progress, treating the just-completed file as 100%
-            # AND as READY, so it is excluded from the "still active" set.
-            # Without this, a LoRA finishing as the last download would leave
-            # the bar parked at its previous value instead of advancing to 100.
-            if instance.download_progress != 100:
-                aggregate = _aggregate_instance_download_progress(
-                    instance,
-                    file,
-                    override_progress=100.0,
-                    override_state=ModelFileStateEnum.READY,
-                )
-                if aggregate is not None and aggregate != instance.download_progress:
-                    instance.download_progress = aggregate
-                    need_update = True
-
-        if await model_instance_download_completed(session, instance):
-            # Every linked ModelFile is READY: compute LoRA paths for vLLM before STARTING.
-            # Workers read mounted_loras from the model_instance event payload when state becomes STARTING.
-            mounted, lora_skipped = await _build_mounted_loras_payload(
-                session, instance
-            )
-            if mounted is not None:
-                instance.mounted_loras = mounted
-            instance.state = ModelInstanceStateEnum.STARTING
-            instance.state_message = "; ".join(lora_skipped) if lora_skipped else ""
-            need_update = True
-        elif instance.state == ModelInstanceStateEnum.INITIALIZING:
-            # one but not all files downloaded, turn to DOWNLOADING state
-            instance.state = ModelInstanceStateEnum.DOWNLOADING
-            instance.state_message = ""
-            need_update = True
-
-    # Download error
+        need_update = await _sync_main_worker_ready(
+            session, instance, file, is_draft_model
+        )
     elif file.state == ModelFileStateEnum.ERROR:
         instance.state = ModelInstanceStateEnum.ERROR
         instance.state_message = file.state_message
@@ -2006,20 +2063,53 @@ async def sync_main_worker_model_file_state(  # noqa: C901
         await ModelInstanceService(session).update(instance)
 
 
-async def sync_distributed_model_file_state(  # noqa: C901
+async def _sync_subordinate_worker(
+    session: AsyncSession,
+    instance: ModelInstance,
+    subordinate: ModelInstanceSubordinateWorker,
+    file: ModelFile,
+) -> bool:
+    """
+    Sync one subordinate worker's file state. subordinate.download_progress is
+    display-only (completion is decided by ModelFile state, not this field).
+    Returns need_update.
+    """
+    if file.state == ModelFileStateEnum.DOWNLOADING:
+        if file.download_progress == subordinate.download_progress:
+            return False
+        subordinate.download_progress = file.download_progress
+        return True
+
+    if file.state == ModelFileStateEnum.READY:
+        # progress may already be 100 from the final DOWNLOADING report, so a
+        # READY event must still re-check completion — gating on the progress
+        # value would skip the STARTING transition and stick at 100%.
+        need_update = subordinate.download_progress != 100
+        subordinate.download_progress = 100
+        if instance.state in (
+            ModelInstanceStateEnum.DOWNLOADING,
+            ModelInstanceStateEnum.INITIALIZING,
+        ):
+            if await _promote_to_starting_if_complete(session, instance):
+                need_update = True
+        return need_update
+
+    if file.state == ModelFileStateEnum.ERROR:
+        instance.state = ModelInstanceStateEnum.ERROR
+        instance.state_message = file.state_message
+        return True
+
+    return False
+
+
+async def sync_distributed_model_file_state(
     session: AsyncSession, file: ModelFile, instance: ModelInstance
 ):
-    """
-    Sync the model file state to the related model instance.
-    """
+    """Sync a subordinate-worker model file's state onto its model instance."""
 
-    # Re-load instance to avoid identity map conflicts (same reason as
-    # sync_main_worker_model_file_state).
+    # Re-load to avoid identity-map conflicts with a detached caller instance.
     instance = await ModelInstance.one_by_id(session, instance.id)
-    if not instance:
-        return
-
-    if instance.state == ModelInstanceStateEnum.ERROR:
+    if not instance or instance.state == ModelInstanceStateEnum.ERROR:
         return
 
     if (
@@ -2028,43 +2118,23 @@ async def sync_distributed_model_file_state(  # noqa: C901
     ):
         return
 
+    subordinate = next(
+        (
+            item
+            for item in instance.distributed_servers.subordinate_workers or []
+            if item.worker_id == file.worker_id
+        ),
+        None,
+    )
+    if subordinate is None:
+        return
+
     logger.trace(
         f"Syncing distributed model file {file.id} with model instance {instance.name}, file state: {file.state}, "
         f"progress: {file.download_progress}, message: {file.state_message}, instance state: {instance.state}"
     )
 
-    need_update = False
-
-    for item in instance.distributed_servers.subordinate_workers or []:
-        if item.worker_id == file.worker_id:
-            if (
-                file.state == ModelFileStateEnum.DOWNLOADING
-                and file.download_progress != item.download_progress
-            ):
-                item.download_progress = file.download_progress
-                need_update = True
-            elif (
-                file.state == ModelFileStateEnum.READY and item.download_progress != 100
-            ):
-                item.download_progress = 100
-                if await model_instance_download_completed(session, instance):
-                    # Mirror non-distributed path: attach LoRA mount list then move to STARTING.
-                    mounted, lora_skipped = await _build_mounted_loras_payload(
-                        session, instance
-                    )
-                    if mounted is not None:
-                        instance.mounted_loras = mounted
-                    instance.state = ModelInstanceStateEnum.STARTING
-                    instance.state_message = (
-                        "; ".join(lora_skipped) if lora_skipped else ""
-                    )
-                need_update = True
-            elif file.state == ModelFileStateEnum.ERROR:
-                instance.state = ModelInstanceStateEnum.ERROR
-                instance.state_message = file.state_message
-                need_update = True
-
-    if need_update:
+    if await _sync_subordinate_worker(session, instance, subordinate, file):
         flag_modified(instance, "distributed_servers")
         await ModelInstanceService(session).update(instance)
 
@@ -2085,7 +2155,7 @@ async def _build_mounted_loras_payload(
         return None, []
     entries = normalized_lora_list(model)
     if not entries:
-        return None, []
+        return [], []
     inst = await ModelInstance.one_by_id_with_model_files(session, instance.id)
     if not inst:
         return None, []
@@ -2119,37 +2189,33 @@ async def _build_mounted_loras_payload(
                 )
             )
             break
-    return (out or None), skipped
+    return out, skipped
 
 
-async def model_instance_download_completed(
-    session: AsyncSession, instance: ModelInstance
-) -> bool:
-    inst = await ModelInstance.one_by_id_with_model_files(session, instance.id)
-    if inst is None:
+def _download_completed(instance: Optional[ModelInstance]) -> bool:
+    """True when every ModelFile (primary, LoRA, draft) is READY. Pure check over
+    an already-loaded instance — the caller owns the single eager load."""
+    if instance is None:
         return False
 
-    if not inst.model_files and not inst.draft_model_source:
+    if not instance.model_files and not instance.draft_model_source:
         return False
 
-    for f in inst.model_files or []:
-        if f.state != ModelFileStateEnum.READY:
+    for model_file in instance.model_files or []:
+        if model_file.state != ModelFileStateEnum.READY:
             return False
 
-    if inst.draft_model_source:
-        draft_files = inst.draft_model_files or []
+    if instance.draft_model_source:
+        draft_files = instance.draft_model_files or []
         if not draft_files:
             return False
-        for f in draft_files:
-            if f.state != ModelFileStateEnum.READY:
+        for draft_file in draft_files:
+            if draft_file.state != ModelFileStateEnum.READY:
                 return False
 
-    # Distributed worker progress check (restored from pre-refactor).
-    if inst.distributed_servers and inst.distributed_servers.download_model_files:
-        for subworker in inst.distributed_servers.subordinate_workers or []:
-            if subworker.download_progress != 100:
-                return False
-
+    # Subordinate files are in instance.model_files (checked above) — the single
+    # source of truth. The old subordinate_workers progress check raced with the
+    # distributed sync path and could stick at DOWNLOADING after all hit 100%.
     return True
 
 
@@ -2175,6 +2241,30 @@ def _get_worker_ids_for_file_download(
         ]
 
     return worker_ids
+
+
+async def _get_worker_tenant_scopes(
+    session: AsyncSession, worker_ids: Iterable[int]
+) -> Dict[int, Tuple[Optional[int], Optional[int]]]:
+    """Resolve ``(cluster_id, owner_principal_id)`` for each worker so newly
+    created ModelFiles inherit the same tenant scope as their host worker —
+    matching the route-side derivation in ``routes/model_files.create_model_file``.
+    Without this, ModelFiles created by the controller come back with NULL
+    tenant columns and are invisible to org principals."""
+    scopes: Dict[int, Tuple[Optional[int], Optional[int]]] = {}
+    unique_worker_ids = {wid for wid in worker_ids if wid is not None}
+    if not unique_worker_ids:
+        return scopes
+    workers = await Worker.all_by_fields(
+        session,
+        extra_conditions=[Worker.id.in_(unique_worker_ids)],
+    )
+    for worker in workers:
+        scopes[worker.id] = (
+            worker.cluster_id,
+            getattr(worker, "owner_principal_id", None),
+        )
+    return scopes
 
 
 async def new_workers_from_pool(
@@ -2212,6 +2302,10 @@ async def new_workers_from_pool(
             cluster=pool.cluster,
             worker_pool=pool,
             provider=pool.cluster.provider,
+            # Denormalize from cluster so cluster_resource_visibility_conditions
+            # can match without joining clusters. Mirrors the worker registration
+            # path in routes/workers.update_worker_data.
+            owner_principal_id=pool.cluster.owner_principal_id,
             name=f"pool-{pool.id}-"
             + ''.join(random.choices(string.ascii_lowercase + string.digits, k=8)),
             labels={
@@ -3113,11 +3207,16 @@ class GPUInstanceController:
     instance and handled inline here.
     """
 
-    PHASE_INSTANCE_CREATE_FAILED = "CreateFailed"
-    PHASE_SSH_KEY_CREATE_FAILED = "SSHPublicKeyCreateFailed"
-    PHASE_PV_TYPE_CREATE_FAILED = "PersistentVolumeTypeCreateFailed"
-    PHASE_PV_CREATE_FAILED = "PersistentVolumeCreateFailed"
-    PHASE_READY = "Ready"
+    PHASE_CREATE_FAILED = GPUInstancePhase.CREATE_FAILED
+    PHASE_SSH_KEY_CREATE_FAILED = GPUInstancePhase.SSH_KEY_CREATE_FAILED
+    PHASE_PV_TYPE_CREATE_FAILED = GPUInstancePhase.PV_TYPE_CREATE_FAILED
+    PHASE_PV_CREATE_FAILED = GPUInstancePhase.PV_CREATE_FAILED
+    PHASE_DELETING = GPUInstancePhase.DELETING
+    PHASE_STOPPING = GPUInstancePhase.STOPPING
+    PHASE_STOPPED = GPUInstancePhase.STOPPED
+    PHASE_STARTING = GPUInstancePhase.STARTING
+    PHASE_UNKNOWN = GPUInstancePhase.UNKNOWN
+    PHASE_READY = GPUInstancePhase.READY
 
     def __init__(self, cfg: Config):
         self._config = cfg
@@ -3128,8 +3227,14 @@ class GPUInstanceController:
         # Per-iid worker tasks. One task per iid serializes processing for
         # that iid without an explicit lock.
         self._workers: Dict[Any, asyncio.Task] = {}
+        # Background sweep that periodically re-confirms Ready instances
+        # against the worker side (the event loop alone never revisits a
+        # Ready row — see ``_reconfirm_loop``).
+        self._reconfirm_task: Optional[asyncio.Task] = None
 
     async def start(self):
+        if envs.GPU_INSTANCE_RECONFIRM_INTERVAL > 0:
+            self._reconfirm_task = asyncio.create_task(self._reconfirm_loop())
         try:
             async for event in GPUInstance.subscribe(source="gpu_instance_controller"):
                 if event.type == EventType.HEARTBEAT:
@@ -3141,9 +3246,11 @@ class GPUInstanceController:
                     instance: GPUInstance = event.data
                     phase = (instance.status or GPUInstanceStatus()).phase
                     if phase is not None:
-                        # Terminal *CreateFailed / fully Ready: nothing to reconcile.
-                        if phase.endswith("CreateFailed") or self._is_all_ready(
-                            instance
+                        # Terminal *Failed / STOPPED / fully Ready: nothing to reconcile.
+                        if (
+                            phase.endswith("Failed")
+                            or phase == self.PHASE_STOPPED
+                            or self._is_all_ready(instance)
                         ):
                             continue
                         # Otherwise let UPDATED logic re-sync against the cluster.
@@ -3164,10 +3271,15 @@ class GPUInstanceController:
                 # UPDATED / DELETED — coalesce per iid and run on a worker task.
                 self._enqueue(event)
         finally:
-            for task in list(self._workers.values()):
+            if self._reconfirm_task is not None:
+                self._reconfirm_task.cancel()
+            tasks = list(self._workers.values())
+            for task in tasks:
                 task.cancel()
-            if self._workers:
-                await asyncio.gather(*self._workers.values(), return_exceptions=True)
+            if self._reconfirm_task is not None:
+                tasks.append(self._reconfirm_task)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     def _enqueue(self, event: Event):
         """Coalesce ``event`` into the per-iid pending slot and ensure a worker."""
@@ -3175,10 +3287,30 @@ class GPUInstanceController:
         if iid is None:
             return
         existing = self._pending.get(iid)
-        # DELETED has the highest priority — never let it be overwritten by a
-        # later UPDATED for the same iid.
-        if existing is not None and existing.type == EventType.DELETED:
-            return
+        if existing is not None:
+            # A periodic re-confirm is best-effort and must never displace a
+            # real pending event. Otherwise a /stop or /start UPDATED (snapshot
+            # phase Stopping/Starting) sitting in the slot would be silently
+            # dropped, and since the sweep only revisits Ready rows the
+            # instance would strand in that phase until restart. The next sweep
+            # tick re-enqueues anyway, so dropping the reconfirm is harmless.
+            if event.reconfirm:
+                return
+            # DELETED is terminal — nothing supersedes it.
+            if existing.type == EventType.DELETED:
+                return
+            # An in-flight UPDATED whose snapshot already reads DELETING is
+            # terminal-bound: a later UPDATED can only carry equal-or-stale
+            # data, so don't let it replace the slot. DELETED is still
+            # allowed through (terminal upgrade).
+            if (
+                existing.type == EventType.UPDATED
+                and event.type == EventType.UPDATED
+                and existing.data is not None
+                and (existing.data.status or GPUInstanceStatus()).phase
+                == self.PHASE_DELETING
+            ):
+                return
         self._pending[iid] = event
         if iid not in self._workers:
             self._workers[iid] = asyncio.create_task(self._worker(iid))
@@ -3205,6 +3337,13 @@ class GPUInstanceController:
         instance: GPUInstance = event.data
         if instance is None:
             return
+        # Periodic re-confirmation (see ``_reconfirm_loop``): a process-local
+        # marker carried on the event. It rides the same per-iid worker so it
+        # serializes with real /stop, /delete events, but reads the worker side
+        # back without the Ready short-circuit.
+        if event.reconfirm:
+            await self._reconcile_reconfirm(instance)
+            return
         if event.type == EventType.UPDATED:
             await self._reconcile_updated(instance, event.changed_fields or {})
         elif event.type == EventType.DELETED:
@@ -3222,7 +3361,11 @@ class GPUInstanceController:
             # UPDATED instead of writing a transient status to bounce off
             # the bus.
             if (phase := (fresh.status or GPUInstanceStatus()).phase) is not None:
-                if phase.endswith("CreateFailed") or self._is_all_ready(fresh):
+                if (
+                    phase.endswith("Failed")
+                    or phase == self.PHASE_STOPPED
+                    or self._is_all_ready(fresh)
+                ):
                     return
                 self._enqueue(Event(type=EventType.UPDATED, data=fresh))
                 return
@@ -3376,7 +3519,7 @@ class GPUInstanceController:
                         session,
                         fresh,
                         GPUInstanceStatus(
-                            phase=self.PHASE_INSTANCE_CREATE_FAILED,
+                            phase=self.PHASE_CREATE_FAILED,
                             phase_message=f"Failed to create worker-side instance: {e}",
                             namespace=ops.org_namespace,
                         ),
@@ -3388,9 +3531,9 @@ class GPUInstanceController:
                 # back the real cluster status without a bus round-trip.
                 self._enqueue(Event(type=EventType.UPDATED, data=fresh))
 
-    async def _reconcile_updated(
+    async def _reconcile_updated(  # noqa: C901
         self, instance: GPUInstance, changed_fields: Dict[str, Tuple[Any, Any]]
-    ):  # noqa: C901
+    ):
         async with async_session() as session:
             fresh = await GPUInstance.one_by_id(session, instance.id)
             if fresh is None or fresh.deleted_at is not None:
@@ -3414,47 +3557,203 @@ class GPUInstanceController:
                             f"Failed to sync worker-side ssh public key for {fresh.name}"
                         )
 
-                if (phase := (fresh.status or GPUInstanceStatus()).phase) is not None:
-                    if phase.endswith("CreateFailed"):
+                # Phase-specific handling.
+                phase = (fresh.status or GPUInstanceStatus()).phase
+                if phase is not None:
+                    if phase == self.PHASE_DELETING:
+                        # Delete the worker-side CR and fall through to
+                        # read_instance, which drives the DB cleanup when
+                        # the CR is gone.
+                        logger.debug(
+                            f"GPUInstance {fresh.name} is in {phase} phase, try deleting worker-side instance"
+                        )
+                        try:
+                            await ops.delete_instance(fresh.name)
+                        except Exception as e:
+                            logger.exception(
+                                f"Failed to delete worker-side instance for {fresh.name}"
+                            )
+                            await self._set_status(
+                                session,
+                                fresh,
+                                (fresh.status or GPUInstanceStatus()).model_copy(
+                                    update={
+                                        "phase": phase,
+                                        "phase_message": f"Failed to delete worker-side instance, will retry: {e}",
+                                        "namespace": ops.org_namespace,
+                                    }
+                                ),
+                            )
+                            return
+                    elif phase == self.PHASE_STOPPING:
+                        # Patch ``spec.stop=true``; the worker operator
+                        # tears the workload down and eventually reports
+                        # ``status.phase=Stopped``, at which point the
+                        # read_instance block flips the row to STOPPED.
+                        logger.debug(
+                            f"GPUInstance {fresh.name} is in {phase} phase, try stopping worker-side instance"
+                        )
+                        try:
+                            await ops.stop_instance(fresh.name)
+                        except Exception as e:
+                            logger.exception(
+                                f"Failed to stop worker-side instance for {fresh.name}"
+                            )
+                            await self._set_status(
+                                session,
+                                fresh,
+                                (fresh.status or GPUInstanceStatus()).model_copy(
+                                    update={
+                                        "phase_message": f"Failed to stop worker-side instance, will retry: {e}",
+                                        "namespace": ops.org_namespace,
+                                    }
+                                ),
+                            )
+                            return
+                    elif phase == self.PHASE_STARTING:
+                        # Patch ``spec.stop`` off (merge-patch null). When
+                        # the CR is missing (legacy STOPPED row whose CR
+                        # was deleted, or retry from *CreateFailed before
+                        # the initial create succeeded), bootstrap the CR
+                        # from scratch so /start works uniformly.
+                        logger.debug(
+                            f"GPUInstance {fresh.name} is in {phase} phase, try starting worker-side instance"
+                        )
+                        try:
+                            patched = await ops.start_instance(fresh.name)
+                            if patched is None:
+                                await ops.create_instance(
+                                    name=fresh.name,
+                                    spec=spec_instance(fresh),
+                                )
+                        except Exception as e:
+                            logger.exception(
+                                f"Failed to start worker-side instance for {fresh.name}"
+                            )
+                            await self._set_status(
+                                session,
+                                fresh,
+                                (fresh.status or GPUInstanceStatus()).model_copy(
+                                    update={
+                                        "phase_message": f"Failed to start worker-side instance, will retry: {e}",
+                                        "namespace": ops.org_namespace,
+                                    }
+                                ),
+                            )
+                            return
+                    elif phase.endswith("Failed"):
                         logger.warning(
                             f"GPUInstance {fresh.name} is in {phase} phase, skip updating"
                         )
                         return
-                    if self._is_all_ready(fresh):
+                    elif phase == self.PHASE_STOPPED:
+                        # Terminal Stopped: the worker-side instance was
+                        # confirmed gone in a previous reconcile and we don't
+                        # want to bounce back to Unknown via the read_instance
+                        # block below. The row stays here until /start
+                        # (Starting) or /delete (Deleting).
                         logger.debug(
-                            f"GPUInstance {fresh.name} is already in Ready phase, skip updating"
+                            f"GPUInstance {fresh.name} is in {phase} phase, skip updating"
                         )
                         return
-                    logger.debug(
-                        f"GPUInstance {fresh.name} is not all ready, try updating and reconciling"
-                    )
+                    elif phase == self.PHASE_UNKNOWN:
+                        count = (fresh.status or GPUInstanceStatus()).count
+                        if count > 5:
+                            logger.warning(
+                                f"GPUInstance {fresh.name} has been in {phase} phase for {count} updates, skip updating"
+                            )
+                            return
+                    elif self._is_all_ready(fresh):
+                        logger.debug(
+                            f"GPUInstance {fresh.name} is already in {phase} phase, skip updating"
+                        )
+                        return
+                    else:
+                        logger.debug(
+                            f"GPUInstance {fresh.name} is in {phase} phase, try updating and reconciling"
+                        )
 
                 # Read the instance to get the latest status.
                 try:
                     read = await ops.read_instance(fresh.name)
                     if read is None:
+                        if phase == self.PHASE_DELETING:
+                            # CR gone — hard-delete the DB row. The DELETED
+                            # event drives _reconcile_deleted for SSH key /
+                            # PV cleanup; return so we don't touch ``fresh``
+                            # again.
+                            await fresh.delete(session)
+                            return
+                        elif phase == self.PHASE_STOPPING:
+                            # CR vanished while stopping — treat as stopped.
+                            await self._set_status(
+                                session,
+                                fresh,
+                                GPUInstanceStatus(
+                                    phase=self.PHASE_STOPPED,
+                                    phase_message="Worker-side instance not found",
+                                    namespace=ops.org_namespace,
+                                ),
+                            )
+                            return
                         read = {
                             "status": {
-                                "phase": "Unknown",
+                                "phase": self.PHASE_UNKNOWN,
                                 "phaseMessage": "Not found in cluster",
                             }
                         }
+                    # else: the normal path — read back the real status to sync the DB
                 except Exception:
                     logger.exception(
                         f"Failed to read worker-side instance for {fresh.name}"
                     )
+
+                    # If reading fails, keep the in-flight phase.
+                    if phase not in (
+                        self.PHASE_DELETING,
+                        self.PHASE_STOPPING,
+                        self.PHASE_STARTING,
+                    ):
+                        phase = self.PHASE_UNKNOWN
+
                     read = {
-                        "status": {
-                            "phase": "Unknown",
-                            "phaseMessage": "Failed to read from cluster",
-                        }
+                        "status": (fresh.status or GPUInstanceStatus())
+                        .model_copy(
+                            update={
+                                "phase": phase,
+                                "phase_message": "Failed to confirm from cluster, will retry",
+                            }
+                        )
+                        .model_dump(by_alias=True, exclude_none=True),
                     }
+
+                status_payload = dict(read.get("status") or {})
+                status_payload.pop("namespace", None)
+
+                # Hold the in-flight phase until the worker operator has
+                # actually moved: spec.stop was just patched, so the CR's
+                # status.phase typically still reads the pre-patch value
+                # for one reconcile tick. Letting it through would flicker
+                # the row (Stopping→Ready, Starting→Stopped).
+                worker_phase = status_payload.get("phase")
+                if (
+                    (phase == self.PHASE_DELETING)
+                    or (
+                        phase == self.PHASE_STOPPING
+                        and worker_phase != self.PHASE_STOPPED
+                    )
+                    or (
+                        phase == self.PHASE_STARTING
+                        and worker_phase == self.PHASE_STOPPED
+                    )
+                ):
+                    status_payload["phase"] = phase
 
                 await self._set_status(
                     session,
                     fresh,
                     GPUInstanceStatus(
-                        **read.get("status"),
+                        **status_payload,
                         namespace=ops.org_namespace,
                     ),
                 )
@@ -3466,14 +3765,23 @@ class GPUInstanceController:
                 return
             ops, principal_identifier = built
 
+            # When the row went through DELETING, _reconcile_updated
+            # already confirmed the CR was gone before hard-deleting the
+            # row, so skip the redundant cluster delete. STOPPED rows
+            # still have a live (stopped) CR — those need the delete.
+            already_deleted_in_cluster = (
+                instance.status or GPUInstanceStatus()
+            ).phase == self.PHASE_DELETING
+
             async with ops:
                 # Delete Instance.
-                try:
-                    await ops.delete_instance(instance.name)
-                except Exception:
-                    logger.exception(
-                        f"Failed to delete worker-side instance for {instance.name}"
-                    )
+                if not already_deleted_in_cluster:
+                    try:
+                        await ops.delete_instance(instance.name)
+                    except Exception:
+                        logger.exception(
+                            f"Failed to delete worker-side instance for {instance.name}"
+                        )
 
                 # Delete referenced SSH public key.
                 try:
@@ -3597,6 +3905,124 @@ class GPUInstanceController:
                                 f"Failed to delete worker-side pv type {pvt_cluster_name}"
                             )
 
+    async def _reconfirm_loop(self):
+        """Periodically re-confirm Ready instances against the worker side.
+
+        The reconciler is event-driven and intentionally stops touching a
+        row once it is fully Ready (``_is_all_ready`` short-circuits in both
+        ``start`` and ``_reconcile_updated``). But the worker side has no
+        write-back path into the ``GPUInstance`` row, so a post-Ready change
+        on the worker (workload crash, allocation/address change, CR dropping
+        out of Ready, CR deleted) would otherwise never be observed. This
+        sweep re-reads the worker side every
+        ``GPU_INSTANCE_RECONFIRM_INTERVAL`` seconds and only writes back —
+        emitting the usual UPDATED event — when the status actually drifts,
+        so a steady Ready row produces no DB churn or bus traffic.
+
+        Driving this from a timer (rather than a self-perpetuating status
+        write) keeps it self-healing: it re-discovers every Ready row after a
+        server restart, which the startup CREATED replay deliberately drops.
+        """
+        while True:
+            try:
+                await asyncio.sleep(envs.GPU_INSTANCE_RECONFIRM_INTERVAL)
+                await self._enqueue_ready_reconfirm()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Failed to run GPU instance re-confirm sweep")
+
+    async def _enqueue_ready_reconfirm(self):
+        """Enqueue a re-confirm for every row the controller treats as Ready.
+
+        Targets exactly the rows frozen by the ``_is_all_ready`` short-circuit
+        — phase==Ready rows that fall short of it are still driven by the
+        normal event/count loop and don't need the sweep. Routing through
+        ``_enqueue`` reuses the per-iid serialization: ``_enqueue`` drops a
+        reconfirm whenever any real event is already pending for that iid, so
+        the sweep never displaces a /stop, /start, or /delete (it retries on
+        the next tick).
+        """
+        async with async_session() as session:
+            instances = await GPUInstance.all_by_fields(
+                session, fields={"deleted_at": None}
+            )
+        for instance in instances:
+            if not self._is_all_ready(instance):
+                continue
+            # Process-local marker; never published to the bus (see _reconcile)
+            # and dropped by _enqueue if a real event is already pending.
+            event = Event(type=EventType.UPDATED, data=instance, reconfirm=True)
+            self._enqueue(event)
+
+    async def _reconcile_reconfirm(self, instance: GPUInstance):
+        """Re-read the worker side for a Ready row, write back only on drift."""
+        async with async_session() as session:
+            fresh = await GPUInstance.one_by_id(session, instance.id)
+            if fresh is None or fresh.deleted_at is not None:
+                return
+            # Re-check under the fresh row: a real event may have moved the
+            # phase between enqueue and now, in which case the normal loop
+            # already owns it.
+            if not self._is_all_ready(fresh):
+                return
+
+            built = await self._build_ops(session, fresh)
+            if built is None:
+                return
+            ops, _ = built
+            async with ops:
+                try:
+                    read = await ops.read_instance(fresh.name)
+                except Exception:
+                    logger.exception(
+                        f"Failed to re-confirm worker-side instance for {fresh.name}"
+                    )
+                    # Transient — leave the row as-is; the next sweep retries.
+                    return
+
+                if read is None:
+                    # The CR vanished under a Ready row: real drift. Hand it
+                    # back to the event/count loop via Unknown rather than
+                    # writing a synthetic Ready.
+                    await self._set_status(
+                        session,
+                        fresh,
+                        GPUInstanceStatus(
+                            phase=self.PHASE_UNKNOWN,
+                            phase_message="Not found in cluster",
+                            namespace=ops.org_namespace,
+                        ),
+                        require_current_phase=self.PHASE_READY,
+                    )
+                    return
+
+                status_payload = dict(read.get("status") or {})
+                status_payload.pop("namespace", None)
+                candidate = GPUInstanceStatus(
+                    **status_payload,
+                    namespace=ops.org_namespace,
+                )
+                current = fresh.status or GPUInstanceStatus()
+                if self._status_equivalent(current, candidate):
+                    # No worker-side drift — no write, no event.
+                    return
+
+                # Guard the read→write window: only persist while the row is
+                # still Ready, so a /stop or /start that landed during
+                # read_instance isn't clobbered (the real event drives it).
+                await self._set_status(
+                    session,
+                    fresh,
+                    candidate,
+                    require_current_phase=self.PHASE_READY,
+                )
+
+    @staticmethod
+    def _status_equivalent(a: GPUInstanceStatus, b: GPUInstanceStatus) -> bool:
+        """Compare two statuses ignoring the server-only retry ``count``."""
+        return a.model_dump(exclude={"count"}) == b.model_dump(exclude={"count"})
+
     async def _build_ops(
         self,
         session: AsyncSession,
@@ -3654,12 +4080,53 @@ class GPUInstanceController:
         session: AsyncSession,
         instance: GPUInstance,
         expected: GPUInstanceStatus,
+        require_current_phase: Optional[str] = None,
     ):
-        """Update the status of the instance with the expected status."""
+        """Persist ``expected`` onto the row's status.
+
+        DELETING is sticky: if /delete landed on the row mid-reconcile,
+        the DB now reads DELETING and we drop the write so a stale
+        Stopping/Starting/etc. from this reconcile cannot resurrect a
+        non-DELETING phase. ``session.refresh`` reloads the column
+        values from the DB to close the cross-session race.
+
+        ``require_current_phase`` is an optional precondition for callers
+        that must not clobber a phase a concurrent action moved the row
+        into. The periodic re-confirm passes ``Ready``: between its
+        ``_is_all_ready`` check and this write a /stop or /start could land
+        Stopping/Starting, and blindly writing the (stale) re-read status
+        would overwrite it and strand the instance — the sweep only revisits
+        Ready rows. When the live phase no longer matches, the write is
+        dropped and the real pending event drives the transition.
+        """
+        await session.refresh(instance)
         current = instance.status or GPUInstanceStatus()
+        if (
+            current.phase == GPUInstancePhase.DELETING
+            and expected.phase != GPUInstancePhase.DELETING
+        ):
+            return
+        if require_current_phase is not None and current.phase != require_current_phase:
+            return
         if current.phase == expected.phase:
             expected.count = current.count + 1
             await asyncio.sleep(expected.count % 15)
+            # The sleep above yields the event loop, so a concurrent
+            # /delete (or /stop, /start) can land a new phase on the row
+            # between the guard check and the write below. Re-read and
+            # re-check before committing the stale expected status.
+            await session.refresh(instance)
+            current = instance.status or GPUInstanceStatus()
+            if (
+                current.phase == GPUInstancePhase.DELETING
+                and expected.phase != GPUInstancePhase.DELETING
+            ):
+                return
+            if (
+                require_current_phase is not None
+                and current.phase != require_current_phase
+            ):
+                return
         expected_dump = expected.model_dump(by_alias=True, exclude_none=True)
         await instance.update(session, source={"status": expected_dump})
 

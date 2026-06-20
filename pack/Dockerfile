@@ -22,7 +22,7 @@
 # - HIGRESS_APISERVER_VERSION: Version of Higress API server to use.
 ARG PYTHON_VERSION=3.11
 ARG GPUSTACK_BASE_IMAGE=base
-ARG GPUSTACK_OPERATOR_VERSION=v0.1.0
+ARG GPUSTACK_OPERATOR_VERSION=v0.5.1
 ARG GPUSTACK_RUNTIME_ROCM_VERSION=7.0.2
 ARG GPUSTACK_RUNTIME_DOCKER_MIRRORED_NAME_FILTER_LABELS
 ARG HIGRESS_VERSION=2.1.9
@@ -771,7 +771,7 @@ ENV GPUSTACK_RUNTIME_LOG_EXCEPTION="false" \
     GPUSTACK_RUNTIME_DOCKER_IMAGE_NO_PULL_VISUALIZATION="true" \
     GPUSTACK_RUNTIME_DOCKER_MIRRORED_NAME_FILTER_LABELS="${GPUSTACK_RUNTIME_DOCKER_MIRRORED_NAME_FILTER_LABELS}"
 
-COPY --from=gpustack-operator /usr/bin/gpustack /usr/bin/gpustack-operator
+COPY --from=gpustack-operator /usr/bin/gpustack-operator /usr/bin/gpustack-operator
 COPY --chmod=755 pack/entrypoint.sh /usr/bin/entrypoint.sh
 
 ## KUBE_FEATURE_WatchListClient=false: Disable WatchListClient to avoid potential issues with Kubernetes API server versions that do not support it.

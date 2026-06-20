@@ -1,3 +1,35 @@
+"""GPU instance HTTP routes.
+
+``status.phase`` is the source of truth; the controller reconciles it
+against the worker-side ``Instance`` CR. State machine:
+
+    None ──► Pending ──► NotReady ──► Ready
+                                       │
+                              /stop ───┤
+                                       ▼
+            Stopping ─(operator reports phase=Stopped)─► Stopped
+                                                          │
+                                                    /start│
+                                                          ▼
+                                                       Starting
+                                                          │
+                                          ────────────────┘
+                                          ▼ (re-enters Pending → … → Ready)
+
+    *Failed (initial-create failures; terminal until):
+        - /delete ─► Deleting (cleanup)
+
+    /delete works from **any** phase and is sticky: the controller's
+    ``_set_status`` refuses to overwrite a row that already reads
+    Deleting, so an in-flight Stopping/Starting reconcile cannot
+    resurrect it.
+
+Route → target phase:
+    DELETE /{id}        → Deleting   (any phase)
+    PUT    /{id}/stop   → Stopping   (rejected from in-flight / terminal phases)
+    PUT    /{id}/start  → Starting   (only from Stopped)
+"""
+
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -5,6 +37,7 @@ from fastapi import APIRouter, Depends
 from starlette.responses import StreamingResponse
 
 from gpustack.api.exceptions import (
+    AlreadyExistsException,
     InternalServerErrorException,
     InvalidException,
     NotFoundException,
@@ -27,6 +60,7 @@ from gpustack.schemas import (
     GPUInstancesPublic,
     GPUInstanceCreate,
 )
+from gpustack.schemas.gpu_instances import GPUInstancePhase, GPUInstanceStatus
 from gpustack.schemas.principals import platform_principal_id
 from gpustack.server.db import async_session
 from gpustack.server.deps import SessionDep, TenantContextDep
@@ -107,6 +141,18 @@ async def create_gpu_instance(
 
     persistent_volume_id = await _validate_create_obj(session, ctx, create_obj)
 
+    existed = await GPUInstance.exist_by_fields(
+        session=session,
+        fields={
+            "owner_principal_id": create_obj.owner_principal_id,
+            "name": create_obj.name,
+        },
+    )
+    if existed:
+        raise AlreadyExistsException(
+            message=(f"GPU instance with name '{create_obj.name}' already exists."),
+        )
+
     source = _build_create_source(create_obj, ctx.user.id, persistent_volume_id)
     async with handle_error(
         message="Failed to create GPU instance",
@@ -146,26 +192,55 @@ async def update_gpu_instance(
         return ret
 
 
-@router.delete("/{id}")
+@router.delete("/{id}", status_code=202, response_model=GPUInstancePublic)
 async def delete_gpu_instance(
     session: SessionDep,
     ctx: TenantContextDep,
     id: int,
 ):
-    ret = ensure_writable(
-        await GPUInstance.one_by_id(
-            session=session,
-            id=id,
-        ),
+    """Mark the instance for deletion (allowed from any phase)."""
+    return await _transition_to_phase(
+        session,
         ctx,
+        id,
+        action="delete",
+        target_phase=GPUInstancePhase.DELETING,
+        fail_message="Failed to delete GPU instance",
     )
 
-    async with handle_error(
-        message="Failed to delete GPU instance",
-    ):
-        await ret.delete(
-            session=session,
-        )
+
+@router.put("/{id}/stop", status_code=202, response_model=GPUInstancePublic)
+async def stop_gpu_instance(
+    session: SessionDep,
+    ctx: TenantContextDep,
+    id: int,
+):
+    """Mark the instance for stopping."""
+    return await _transition_to_phase(
+        session,
+        ctx,
+        id,
+        action="stop",
+        target_phase=GPUInstancePhase.STOPPING,
+        fail_message="Failed to stop GPU instance",
+    )
+
+
+@router.put("/{id}/start", status_code=202, response_model=GPUInstancePublic)
+async def start_gpu_instance(
+    session: SessionDep,
+    ctx: TenantContextDep,
+    id: int,
+):
+    """Mark the instance for starting."""
+    return await _transition_to_phase(
+        session,
+        ctx,
+        id,
+        action="start",
+        target_phase=GPUInstancePhase.STARTING,
+        fail_message="Failed to start GPU instance",
+    )
 
 
 def ensure_visible(obj, ctx: TenantContext):
@@ -365,3 +440,91 @@ def _build_update_source(
         source["spec"] = merged_spec
 
     return source
+
+
+def _build_update_phase_source(existing_obj: GPUInstance, phase: str) -> dict:
+    """Stamp ``phase`` onto status, resetting ``count`` and ``phase_message``
+    so the controller restarts its backoff from zero on the new phase."""
+    base = existing_obj.status or GPUInstanceStatus()
+    return {
+        "status": base.model_copy(
+            update={
+                "phase": phase,
+                "phase_message": None,
+                "count": 0,
+            },
+        ),
+    }
+
+
+# Source-phase gates for each lifecycle action. /delete has no gate
+# (allowed from any phase, including ``None`` pre-create).
+_FAILED_PHASES = frozenset(
+    {
+        GPUInstancePhase.CREATE_FAILED,
+        GPUInstancePhase.SSH_KEY_CREATE_FAILED,
+        GPUInstancePhase.PV_TYPE_CREATE_FAILED,
+        GPUInstancePhase.PV_CREATE_FAILED,
+        GPUInstancePhase.INITIALIZE_FAILED,
+    }
+)
+_STOP_DISALLOWED_FROM = (
+    frozenset(
+        {
+            GPUInstancePhase.DELETING,
+            GPUInstancePhase.STOPPING,
+            GPUInstancePhase.STOPPED,
+            GPUInstancePhase.STARTING,
+            GPUInstancePhase.NOT_READY,
+        }
+    )
+    | _FAILED_PHASES
+)
+_START_ALLOWED_FROM = frozenset({GPUInstancePhase.STOPPED})
+
+
+async def _transition_to_phase(
+    session: AsyncSession,
+    ctx: TenantContext,
+    id: int,
+    *,
+    action: str,
+    target_phase: str,
+    fail_message: str,
+) -> GPUInstance:
+    """Load + ownership-check the row, gate the transition by ``action``,
+    stamp the target phase, and persist. Returns the updated row."""
+    ret = ensure_writable(
+        await GPUInstance.one_by_id(
+            session=session,
+            id=id,
+        ),
+        ctx,
+    )
+
+    current_phase = ret.status.phase if ret.status else None
+    if action == "stop":
+        if current_phase is None or current_phase in _STOP_DISALLOWED_FROM:
+            raise InvalidException(
+                message=(
+                    f"GPU instance cannot be stopped from "
+                    f"{current_phase or 'pending creation'} phase"
+                ),
+            )
+    elif action == "start":
+        if current_phase not in _START_ALLOWED_FROM:
+            raise InvalidException(
+                message=(
+                    f"GPU instance cannot be started from "
+                    f"{current_phase or 'pending creation'} phase"
+                ),
+            )
+
+    source = _build_update_phase_source(ret, target_phase)
+
+    async with handle_error(message=fail_message):
+        await ret.update(
+            session=session,
+            source=source,
+        )
+        return ret

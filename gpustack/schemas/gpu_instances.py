@@ -397,6 +397,33 @@ class GPUInstanceDevicesAllocationGroup(BaseModel):
     """
 
 
+class GPUInstancePhase:
+    """Canonical phase strings written to :class:`GPUInstanceStatus.phase`.
+
+    Defined here (not on the controller) so the route layer can reference
+    them without importing controllers, which would create a circular
+    dependency.
+    """
+
+    # GPUStack-specific phases:
+
+    CREATE_FAILED = "CreateFailed"
+    SSH_KEY_CREATE_FAILED = "SSHPublicKeyCreateFailed"
+    PV_TYPE_CREATE_FAILED = "PersistentVolumeTypeCreateFailed"
+    PV_CREATE_FAILED = "PersistentVolumeCreateFailed"
+    DELETING = "Deleting"
+    STOPPING = "Stopping"
+    STOPPED = "Stopped"
+    STARTING = "Starting"
+    UNKNOWN = "Unknown"
+
+    # Kubernetes-specific phases:
+
+    INITIALIZE_FAILED = "InitializeFailed"
+    NOT_READY = "NotReady"
+    READY = "Ready"
+
+
 class GPUInstanceStatus(BaseModel):
     """
     Represents the status of a GPU instance, including any relevant state information.

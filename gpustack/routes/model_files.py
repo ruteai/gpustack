@@ -14,6 +14,8 @@ from gpustack.api.tenant import (
     bypass_tenant_filter,
     assert_cluster_resource_visible,
     cluster_resource_visibility_conditions,
+    cluster_scoped_system,
+    scoped_cluster_row_visible,
 )
 from gpustack.schemas.workers import Worker
 from gpustack.server.db import async_session
@@ -33,6 +35,8 @@ router = APIRouter()
 
 def _make_model_file_visibility_filter(ctx):
     def _visible(m: ModelFile) -> bool:
+        if cluster_scoped_system(ctx):
+            return scoped_cluster_row_visible(ctx, m)
         if bypass_tenant_filter(ctx):
             return True
         org_id = getattr(m, "owner_principal_id", None)
@@ -157,7 +161,10 @@ async def get_model_file(session: SessionDep, ctx: TenantContextDep, id: int):
     return model_file
 
 
-@router.post("", response_model=ModelFilePublic)
+@router.post(
+    "",
+    response_model=ModelFilePublic,
+)
 async def create_model_file(
     session: SessionDep, ctx: TenantContextDep, model_file_in: ModelFileCreate
 ):
@@ -215,7 +222,10 @@ async def create_model_file(
     return model_file
 
 
-@router.put("/{id}", response_model=ModelFilePublic)
+@router.put(
+    "/{id}",
+    response_model=ModelFilePublic,
+)
 async def update_model_file(
     session: SessionDep,
     ctx: TenantContextDep,
@@ -235,7 +245,9 @@ async def update_model_file(
     return model_file
 
 
-@router.delete("/{id}")
+@router.delete(
+    "/{id}",
+)
 async def delete_model_file(
     session: SessionDep,
     ctx: TenantContextDep,
@@ -267,7 +279,10 @@ async def delete_model_file(
         raise InternalServerErrorException(message=f"Failed to delete model file: {e}")
 
 
-@router.post("/{id}/reset", response_model=ModelFilePublic)
+@router.post(
+    "/{id}/reset",
+    response_model=ModelFilePublic,
+)
 async def reset_model_file(session: SessionDep, ctx: TenantContextDep, id: int):
     model_file = await ModelFile.one_by_id(session, id)
     assert_cluster_resource_visible(

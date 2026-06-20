@@ -71,6 +71,7 @@ Revises: 8bf38a6bb3b5
 Create Date: 2026-04-28 12:00:00.000000
 
 """
+from datetime import datetime, timezone
 from typing import Sequence, Union
 
 from alembic import op
@@ -261,6 +262,17 @@ def upgrade() -> None:
     org_role = _org_role_ref(bind)
     principal_type = _principal_type_ref(bind)
 
+    # Stamp seeded rows with an explicit UTC instant rather than the
+    # dialect's ``CURRENT_TIMESTAMP``. Postgres / MySQL / openGauss
+    # convert ``CURRENT_TIMESTAMP`` to the session/server timezone when
+    # writing into a ``TIMESTAMP WITHOUT TIME ZONE`` column, but the
+    # app's ``UTCDateTime`` decoder assumes the stored naive value IS
+    # UTC and tags it accordingly on read — so a non-UTC DB server
+    # surfaces the "Default" Org (and other seeded rows) with a
+    # ``created_at`` that drifts from real wall time by the server's
+    # tz offset.
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+
     if dialect == 'postgresql':
         # Eagerly create the enum types so subsequent column references
         # can rely on them existing. The ``_ref`` variants used in
@@ -380,7 +392,7 @@ def upgrade() -> None:
                 {bool_false}, {bool_true}, {bool_false}, {bool_false},
                 '',
                 'Local',
-                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL
+                :now_utc, :now_utc, NULL
             WHERE NOT EXISTS (
                 SELECT 1 FROM users WHERE name = :name
             )
@@ -389,6 +401,7 @@ def upgrade() -> None:
             name=PLATFORM_PRINCIPAL_NAME,
             display_name=PLATFORM_PRINCIPAL_DISPLAY_NAME,
             desc='Built-in platform organization',
+            now_utc=now_utc,
         )
     )
 
@@ -586,7 +599,7 @@ def upgrade() -> None:
                     (parent_principal_id, member_principal_id, role,
                      created_at, updated_at, deleted_at)
                 SELECT :platform_id, p.id, 'OWNER'::orgrole,
-                       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL
+                       :now_utc, :now_utc, NULL
                 FROM principals p
                 WHERE p.kind = 'USER'::principaltype
                   AND p.is_admin = true
@@ -598,7 +611,7 @@ def upgrade() -> None:
                       AND m.deleted_at IS NULL
                   )
                 """
-            ).bindparams(platform_id=platform_id)
+            ).bindparams(platform_id=platform_id, now_utc=now_utc)
         )
     else:
         op.execute(
@@ -608,7 +621,7 @@ def upgrade() -> None:
                     (parent_principal_id, member_principal_id, role,
                      created_at, updated_at, deleted_at)
                 SELECT :platform_id, p.id, 'OWNER',
-                       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL
+                       :now_utc, :now_utc, NULL
                 FROM principals p
                 WHERE p.kind = 'USER'
                   AND p.is_admin = 1
@@ -620,7 +633,7 @@ def upgrade() -> None:
                       AND m.deleted_at IS NULL
                   )
                 """
-            ).bindparams(platform_id=platform_id)
+            ).bindparams(platform_id=platform_id, now_utc=now_utc)
         )
 
     # ------------------------------------------------------------------
@@ -770,16 +783,18 @@ def upgrade() -> None:
     # ------------------------------------------------------------------
     # 11. Cluster-derived denormalized owner_principal_id columns.
     # ------------------------------------------------------------------
-    # Workers, model_files, benchmarks, model_providers, model_usages
-    # all need an owner pointer for per-row filtering. Nullable
-    # (NULL = on a global cluster, admin-managed); ON DELETE SET NULL
-    # keeps rows alive when the owner principal is deleted (principal
-    # delete cascades clusters, which cascade their workers anyway).
+    # Workers, model_files, benchmarks, model_usages all need an owner
+    # pointer for per-row filtering. Nullable (NULL = on a global
+    # cluster, admin-managed); ON DELETE SET NULL keeps rows alive
+    # when the owner principal is deleted (principal delete cascades
+    # clusters, which cascade their workers anyway).
+    #
+    # ``model_providers`` was originally in this group but later moved
+    # to the always-owned tier — see step 11b below.
     for tbl in (
         'workers',
         'model_files',
         'benchmarks',
-        'model_providers',
         'model_usages',
     ):
         if not column_exists(tbl, 'owner_principal_id'):
@@ -860,6 +875,231 @@ def upgrade() -> None:
         with op.batch_alter_table('model_files', schema=None) as batch_op:
             batch_op.add_column(
                 sa.Column('cluster_id', sa.Integer(), nullable=True)
+            )
+
+    # Backfill the cluster-derived tenant columns just added above. The
+    # ADD COLUMN step leaves every legacy row with NULL ``cluster_id`` /
+    # ``owner_principal_id``, which makes them invisible to non-bypass
+    # principals (cluster_access filter requires one to match). Derive
+    # the scope from the row's worker → cluster, same way the runtime
+    # paths (``routes/model_files.create_model_file`` /
+    # ``controllers._get_worker_tenant_scopes``) stamp new rows.
+    #
+    # Order matters: workers.owner_principal_id is sourced from
+    # clusters.owner_principal_id (already backfilled in section 10),
+    # and model_files / benchmarks read back through workers — so
+    # workers first, dependents second.
+    if dialect == 'mysql':
+        op.execute(
+            sa.text(
+                """
+                UPDATE workers w
+                JOIN clusters c ON c.id = w.cluster_id
+                SET w.owner_principal_id = c.owner_principal_id
+                WHERE w.owner_principal_id IS NULL
+                """
+            )
+        )
+        op.execute(
+            sa.text(
+                """
+                UPDATE model_files mf
+                JOIN workers w ON w.id = mf.worker_id
+                SET mf.cluster_id = w.cluster_id,
+                    mf.owner_principal_id = w.owner_principal_id
+                WHERE mf.worker_id IS NOT NULL
+                  AND (mf.cluster_id IS NULL OR mf.owner_principal_id IS NULL)
+                """
+            )
+        )
+        op.execute(
+            sa.text(
+                """
+                UPDATE benchmarks b
+                JOIN workers w ON w.id = b.worker_id
+                SET b.cluster_id = w.cluster_id,
+                    b.owner_principal_id = w.owner_principal_id
+                WHERE b.worker_id IS NOT NULL
+                  AND (b.cluster_id IS NULL OR b.owner_principal_id IS NULL)
+                """
+            )
+        )
+    else:
+        op.execute(
+            sa.text(
+                """
+                UPDATE workers
+                SET owner_principal_id = (
+                    SELECT clusters.owner_principal_id
+                    FROM clusters
+                    WHERE clusters.id = workers.cluster_id
+                )
+                WHERE owner_principal_id IS NULL
+                  AND EXISTS (
+                    SELECT 1 FROM clusters
+                    WHERE clusters.id = workers.cluster_id
+                  )
+                """
+            )
+        )
+        op.execute(
+            sa.text(
+                """
+                UPDATE model_files
+                SET cluster_id = (
+                    SELECT workers.cluster_id
+                    FROM workers
+                    WHERE workers.id = model_files.worker_id
+                ),
+                owner_principal_id = (
+                    SELECT workers.owner_principal_id
+                    FROM workers
+                    WHERE workers.id = model_files.worker_id
+                )
+                WHERE model_files.worker_id IS NOT NULL
+                  AND (model_files.cluster_id IS NULL
+                       OR model_files.owner_principal_id IS NULL)
+                  AND EXISTS (
+                    SELECT 1 FROM workers
+                    WHERE workers.id = model_files.worker_id
+                  )
+                """
+            )
+        )
+        op.execute(
+            sa.text(
+                """
+                UPDATE benchmarks
+                SET cluster_id = (
+                    SELECT workers.cluster_id
+                    FROM workers
+                    WHERE workers.id = benchmarks.worker_id
+                ),
+                owner_principal_id = (
+                    SELECT workers.owner_principal_id
+                    FROM workers
+                    WHERE workers.id = benchmarks.worker_id
+                )
+                WHERE benchmarks.worker_id IS NOT NULL
+                  AND (benchmarks.cluster_id IS NULL
+                       OR benchmarks.owner_principal_id IS NULL)
+                  AND EXISTS (
+                    SELECT 1 FROM workers
+                    WHERE workers.id = benchmarks.worker_id
+                  )
+                """
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # 11b. ``model_providers``: always-owned (no Global notion).
+    # ------------------------------------------------------------------
+    # Only ``gpu_instance_templates`` and ``inference_backends`` carry a
+    # NULL-owner Global notion. Providers always belong to an Org —
+    # admin in "All" mode creates them under the platform Org. Mirrors
+    # the ``models`` block in step 9: add nullable so the DDL accepts
+    # pre-existing rows, backfill to the platform Org, then lock to
+    # NOT NULL with a CASCADE FK.
+    if table_exists('model_providers') and not column_exists(
+        'model_providers', 'owner_principal_id'
+    ):
+        with op.batch_alter_table('model_providers', schema=None) as batch_op:
+            batch_op.add_column(
+                sa.Column('owner_principal_id', sa.Integer(), nullable=True)
+            )
+
+        op.execute(
+            sa.text(
+                "UPDATE model_providers SET owner_principal_id = :pid "
+                "WHERE owner_principal_id IS NULL"
+            ).bindparams(pid=platform_id)
+        )
+
+        with op.batch_alter_table('model_providers', schema=None) as batch_op:
+            batch_op.alter_column(
+                'owner_principal_id',
+                existing_type=sa.Integer(),
+                nullable=False,
+            )
+            batch_op.create_foreign_key(
+                'fk_model_providers_owner_principal_id_principals',
+                'principals',
+                ['owner_principal_id'],
+                ['id'],
+                ondelete='CASCADE',
+            )
+
+    # ------------------------------------------------------------------
+    # 11c. Convert global UNIQUE on ``name`` to per-owner composite for
+    # ``models``, ``model_providers``, and ``model_routes``.
+    # ------------------------------------------------------------------
+    # These tables used to enforce ``name`` as globally unique. With
+    # multi-tenancy each row carries an ``owner_principal_id``, so two
+    # Orgs can independently define a "qwen3-0.6b" model / route /
+    # "openai" provider. Drop the legacy global UNIQUE and replace it
+    # with a composite UNIQUE on ``(owner_principal_id, name)``.
+    #
+    # The drop dance mirrors step 12 (inference_backends): MySQL /
+    # OceanBase reflect unique-only indexes via information_schema;
+    # Postgres / openGauss go through ``pg_constraint`` + a fallback
+    # ``DROP INDEX`` for the index Alembic emitted on column-level
+    # ``unique=True``. We avoid ``batch_alter_table`` for the drops so
+    # an idempotent re-run doesn't trip on an already-removed
+    # constraint.
+    for tbl, idx_name, uq_name in (
+        ('models', 'ix_models_name', 'uix_models_name_per_owner'),
+        (
+            'model_providers',
+            'ix_model_providers_name',
+            'uix_model_providers_name_per_owner',
+        ),
+        (
+            'model_routes',
+            'ix_model_routes_name',
+            'uix_model_routes_name_per_owner',
+        ),
+    ):
+        if not table_exists(tbl):
+            continue
+        if dialect == 'postgresql':
+            for name_row in bind.execute(
+                sa.text(
+                    "SELECT c.conname FROM pg_constraint c "
+                    "JOIN pg_class t ON t.oid = c.conrelid "
+                    "WHERE t.relname = :tbl "
+                    "AND c.contype = 'u' "
+                    "AND array_length(c.conkey, 1) = 1 "
+                    "AND (SELECT a.attname FROM pg_attribute a "
+                    "     WHERE a.attrelid = c.conrelid "
+                    "     AND a.attnum = c.conkey[1]) = 'name'"
+                ).bindparams(tbl=tbl)
+            ):
+                op.execute(
+                    f'ALTER TABLE {tbl} '
+                    f'DROP CONSTRAINT IF EXISTS "{name_row[0]}"'
+                )
+            op.execute(f'DROP INDEX IF EXISTS {idx_name}')
+        else:
+            unique_idx_names = [
+                row[0]
+                for row in bind.execute(
+                    sa.text(
+                        "SELECT DISTINCT INDEX_NAME FROM "
+                        "information_schema.STATISTICS "
+                        "WHERE TABLE_SCHEMA = DATABASE() "
+                        "AND TABLE_NAME = :tbl "
+                        "AND COLUMN_NAME = 'name' "
+                        "AND NON_UNIQUE = 0 "
+                        "AND INDEX_NAME <> 'PRIMARY'"
+                    ).bindparams(tbl=tbl)
+                )
+            ]
+            for name in unique_idx_names:
+                op.execute(f"ALTER TABLE {tbl} DROP INDEX `{name}`")
+
+        with op.batch_alter_table(tbl, schema=None) as batch_op:
+            batch_op.create_unique_constraint(
+                uq_name, ['owner_principal_id', 'name']
             )
 
     # ------------------------------------------------------------------
@@ -967,11 +1207,11 @@ def upgrade() -> None:
                 INSERT INTO model_route_principals
                     (route_id, principal_id, created_at, updated_at)
                 SELECT uml.route_id, uml.user_id,
-                       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                       :now_utc, :now_utc
                 FROM {user_link_table} uml
                 WHERE uml.route_id IS NOT NULL AND uml.user_id IS NOT NULL
                 """
-            )
+            ).bindparams(now_utc=now_utc)
         )
 
     # ------------------------------------------------------------------
@@ -1050,13 +1290,13 @@ def upgrade() -> None:
                  created_at, updated_at)
             SELECT id, 'ARGON2', hashed_password,
                    require_password_change,
-                   CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                   :now_utc, :now_utc
               FROM principals
              WHERE kind = 'USER'
                AND hashed_password IS NOT NULL
                AND hashed_password <> ''
             """
-        )
+        ).bindparams(now_utc=now_utc)
     )
 
     with op.batch_alter_table('principals', schema=None) as batch_op:
@@ -1251,7 +1491,7 @@ def upgrade() -> None:
                 'GROUP', :name, :display_name, :desc,
                 {bool_false}, {bool_true},
                 'Local',
-                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL
+                :now_utc, :now_utc, NULL
             WHERE NOT EXISTS (
                 SELECT 1 FROM principals
                 WHERE kind = 'GROUP' AND name = :name
@@ -1264,6 +1504,7 @@ def upgrade() -> None:
                 'Built-in group containing every authenticated principal. '
                 'Grant access to this principal to share a resource with all users.'
             ),
+            now_utc=now_utc,
         )
     )
 
@@ -1289,7 +1530,7 @@ def upgrade() -> None:
                 (cluster_id, principal_id, granted_by,
                  created_at, updated_at, deleted_at)
             SELECT c.id, :authenticated_id, NULL,
-                   CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL
+                   :now_utc, :now_utc, NULL
             FROM clusters c
             WHERE c.owner_principal_id = :platform_id
               AND c.deleted_at IS NULL
@@ -1302,6 +1543,7 @@ def upgrade() -> None:
         ).bindparams(
             authenticated_id=authenticated_id,
             platform_id=platform_id,
+            now_utc=now_utc,
         )
     )
 

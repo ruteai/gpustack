@@ -136,15 +136,20 @@ async def create_gpu_instance_template(
     )
     if existed:
         raise AlreadyExistsException(
-            message="GPU instance template already exists",
+            message=(
+                f"GPU instance template with name '{create_obj.name}' "
+                "already exists."
+            ),
         )
 
+    source: dict = create_obj.model_dump()
+    source["creator_id"] = ctx.user.id
     async with handle_error(
         message="Failed to create GPU instance template",
     ):
         return await GPUInstanceTemplate.create(
             session=session,
-            source=create_obj,
+            source=source,
         )
 
 

@@ -60,6 +60,15 @@ WORKER_UNREACHABLE_CHECK_MODE = os.getenv(
     "GPUSTACK_WORKER_UNREACHABLE_CHECK_MODE", "auto"
 ).lower()
 
+# GPU instance configuration
+# Interval at which the server re-confirms the worker-side status of Ready
+# GPU instances. The reconciler is event-driven and stops touching a row once
+# it is fully Ready, so without this periodic sweep a worker-side change after
+# Ready would never be synced back. A value <= 0 disables the sweep.
+GPU_INSTANCE_RECONFIRM_INTERVAL = int(
+    os.getenv("GPUSTACK_GPU_INSTANCE_RECONFIRM_INTERVAL", 60)
+)  # in seconds
+
 # Model instance configuration
 MODEL_INSTANCE_RESCHEDULE_GRACE_PERIOD = int(
     os.getenv("GPUSTACK_MODEL_INSTANCE_RESCHEDULE_GRACE_PERIOD", 300)
@@ -183,6 +192,49 @@ USAGE_DETAILS_ARCHIVE_BATCH_SIZE = int(
 # cardinality so it does not need a separate cap.
 USAGE_DETAILS_BUFFER_MAX_SIZE = int(
     os.getenv("GPUSTACK_USAGE_DETAILS_BUFFER_MAX_SIZE", 100000)
+)
+
+# ``resource_events`` hot/cold archival — same shape as the model_usage_details
+# pair above. The events table grows much slower (lifecycle events, not per
+# request), so the defaults are conservative.
+USAGE_EVENTS_RETENTION_MONTHS = int(
+    os.getenv("GPUSTACK_USAGE_EVENTS_RETENTION_MONTHS", 13)
+)
+USAGE_EVENTS_ARCHIVE_CRON = os.getenv(
+    "GPUSTACK_USAGE_EVENTS_ARCHIVE_CRON", "30 3 * * *"
+)
+USAGE_EVENTS_ARCHIVE_BATCH_SIZE = int(
+    os.getenv("GPUSTACK_USAGE_EVENTS_ARCHIVE_BATCH_SIZE", 5000)
+)
+
+# ``metered_usage`` hot/cold archival — hourly rollup rows older than the
+# retention window move to ``metered_usage_archive``. Retention must stay far
+# larger than the collector's settlement horizon (hours) so a still-being-
+# written bucket is never archived; 13 months is safe by orders of magnitude.
+METERED_USAGE_RETENTION_MONTHS = int(
+    os.getenv("GPUSTACK_METERED_USAGE_RETENTION_MONTHS", 13)
+)
+METERED_USAGE_ARCHIVE_CRON = os.getenv(
+    "GPUSTACK_METERED_USAGE_ARCHIVE_CRON", "0 4 * * *"
+)
+METERED_USAGE_ARCHIVE_BATCH_SIZE = int(
+    os.getenv("GPUSTACK_METERED_USAGE_ARCHIVE_BATCH_SIZE", 5000)
+)
+
+# metered_usage collector tick — periodic safety net that flushes accumulated
+# seconds for long-running metered resources that haven't had a lifecycle
+# event since the last tick.
+RESOURCE_USAGE_TICK_SECONDS = int(
+    os.getenv("GPUSTACK_RESOURCE_USAGE_TICK_SECONDS", 300)
+)
+STORAGE_USAGE_TICK_SECONDS = int(os.getenv("GPUSTACK_STORAGE_USAGE_TICK_SECONDS", 300))
+
+# Grace window before an elapsed hour-bucket is sealed (finalized for billing).
+# A bucket is sealed once now >= bucket_end + grace, so this absorbs late events
+# / clock skew; keep it comfortably larger than the tick interval. After sealing
+# a bucket is immutable — late segments for it are dropped (and logged).
+METERED_USAGE_SEAL_GRACE_SECONDS = int(
+    os.getenv("GPUSTACK_METERED_USAGE_SEAL_GRACE_SECONDS", 900)
 )
 
 DEFAULT_CLUSTER_KUBERNETES = (

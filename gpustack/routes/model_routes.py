@@ -29,6 +29,7 @@ from gpustack.schemas.model_routes import (
     ModelUserAccessExtended,
     MyModel,
     TargetStateEnum,
+    effective_route_name,
 )
 from gpustack.schemas.links import ModelRoutePrincipalLink
 from gpustack.schemas.principals import platform_principal_id
@@ -262,6 +263,7 @@ async def _get_model_routes(
     target_class: Union[ModelRoute, MyModel] = ModelRoute,
     ctx: Optional[TenantContext] = None,
     include_grants: bool = False,
+    include_owner_prefix: bool = False,
 ):
     fuzzy_fields = {}
     if search:
@@ -341,7 +343,7 @@ async def _get_model_routes(
             conditions = build_category_conditions(session, target_class, categories)
             extra_conditions.append(or_(*conditions))
 
-        return await target_class.paginated_by_query(
+        result = await target_class.paginated_by_query(
             session=session,
             fields=fields,
             fuzzy_fields=fuzzy_fields,
@@ -349,6 +351,68 @@ async def _get_model_routes(
             per_page=params.perPage,
             order_by=params.order_by,
             extra_conditions=extra_conditions,
+        )
+        await _apply_effective_name_to_my_models(
+            session, result.items, enabled=include_owner_prefix
+        )
+        return result
+
+
+async def _apply_effective_name_to_my_models(
+    session: AsyncSession,
+    items: List[Union[ModelRoute, MyModel]],
+    enabled: bool,
+) -> None:
+    """Overwrite ``item.name`` with the OpenAI-style effective name —
+    bare for the platform Org, ``<owner-name>/<name>`` otherwise — so
+    the My Models consumption surface (card, Open-in-Playground) uses
+    the same id ``/v1/models`` reports. Cross-Org grants surface under
+    their owning Org's prefix instead of the caller's current Org,
+    which is the gap a frontend cache lookup can't close (the granting
+    Org isn't in the caller's member list).
+
+    Search/filter remain against the raw ``name`` column on the DB
+    side. Writes go through ``__dict__`` rather than the attribute
+    setter so SQLAlchemy's instrumentation doesn't mark the instance
+    dirty — otherwise a later autoflush (or any caller that adds a
+    commit downstream) would attempt to ``UPDATE`` the
+    ``non_admin_user_models`` view and error. Pydantic's
+    ``from_attributes`` reads via ``getattr``, which still resolves
+    through ``__dict__``, so the response picks up the rewritten value.
+
+    Gated per-endpoint via ``include_owner_prefix``, NOT per
+    ``target_class``: ``get_my_models`` serves both the non-admin
+    ``MyModel`` view and the admin ``ModelRoute`` table from one route,
+    so keying the rewrite off the class diverged the two responses
+    (admin saw raw names, non-admin saw prefixed) and broke frontend
+    consumers that expect one ``name`` format. The endpoint now passes
+    ``include_owner_prefix=True`` for both, while other listing
+    surfaces leave it off and keep the raw ``name``. The ``enabled``
+    short-circuit lives here rather than at the call site so
+    ``_get_model_routes`` stays flat (its cyclomatic complexity is
+    already at the limit).
+    """
+    if not enabled:
+        return
+    if not items:
+        return
+    owner_ids = {
+        item.owner_principal_id for item in items if item.owner_principal_id is not None
+    }
+    if not owner_ids:
+        return
+    stmt = select(Principal.id, Principal.name).where(
+        col(Principal.id).in_(owner_ids),
+        Principal.kind == PrincipalType.ORG,
+    )
+    owner_names: Dict[int, Optional[str]] = dict((await session.exec(stmt)).all())
+    platform_id = platform_principal_id()
+    for item in items:
+        owner_id = item.owner_principal_id
+        item.__dict__['name'] = effective_route_name(
+            route_name=item.name,
+            owner_name=owner_names.get(owner_id) if owner_id is not None else None,
+            is_platform_org=owner_id == platform_id,
         )
 
 
@@ -413,6 +477,7 @@ async def _get_model_route(
     owner_principal_id: Optional[int] = None,
     ctx: Optional[TenantContext] = None,
     include_grants: bool = False,
+    include_owner_prefix: bool = False,
 ):
     fields = {"id": id}
     if user_id is not None:
@@ -453,10 +518,17 @@ async def _get_model_route(
                 existing,
                 not_found_message=f"ModelAccess with id '{id}' not found.",
             )
+    await _apply_effective_name_to_my_models(
+        session, [existing], enabled=include_owner_prefix
+    )
     return existing
 
 
-@router.post("", response_model=ModelRoutePublic, response_model_exclude_none=True)
+@router.post(
+    "",
+    response_model=ModelRoutePublic,
+    response_model_exclude_none=True,
+)
 async def create_model_route(
     session: SessionDep, ctx: TenantContextDep, input: ModelRouteCreate
 ):
@@ -482,7 +554,7 @@ async def create_model_route(
     )
     if existing:
         raise AlreadyExistsException(
-            f"ModelRoute with name '{input.name}' already exists."
+            message=f"Model route with name '{input.name}' already exists."
         )
     source = input.model_dump(exclude={"targets"})
     targets = input.targets or []
@@ -541,7 +613,11 @@ async def create_model_route(
         )
 
 
-@router.put("/{id}", response_model=ModelRoutePublic, response_model_exclude_none=True)
+@router.put(
+    "/{id}",
+    response_model=ModelRoutePublic,
+    response_model_exclude_none=True,
+)
 async def update_model_route(
     id: int,
     session: SessionDep,
@@ -572,7 +648,7 @@ async def update_model_route(
     )
     if duplicated_name and duplicated_name.id != id:
         raise AlreadyExistsException(
-            f"ModelRoute with name '{input.name}' already exists."
+            message=f"Model route with name '{input.name}' already exists."
         )
     existing_name = existing.name
     input_name = input.name
@@ -600,7 +676,9 @@ async def update_model_route(
     return await ModelRoute.one_by_id(session=session, id=id)
 
 
-@router.delete("/{id}")
+@router.delete(
+    "/{id}",
+)
 async def delete_model_route(
     id: int,
     session: SessionDep,
@@ -650,11 +728,17 @@ async def unset_fallback_target(
 async def add_model_route_targets(
     id: int,
     session: SessionDep,
+    ctx: TenantContextDep,
     targets: List[ModelRouteTargetUpdateItem],
 ):
     route = await ModelRoute.one_by_id(session=session, id=id)
     if not route or route.deleted_at is not None:
         raise NotFoundException(f"ModelRoute with id '{id}' not found.")
+    assert_resource_visible(
+        ctx,
+        route,
+        not_found_message=f"ModelRoute with id '{id}' not found.",
+    )
     target_count, created_targets = await batch_handle_targets(
         session=session,
         route_id=route.id,
@@ -985,6 +1069,7 @@ async def get_model_route_targets(
 async def update_model_route_target(
     id: int,
     session: SessionDep,
+    ctx: TenantContextDep,
     input: ModelRouteTargetUpdate,
 ):
     existing = await ModelRouteTarget.one_by_id(
@@ -996,9 +1081,16 @@ async def update_model_route_target(
     # Resolve the owning route's tenant so validate_targets can enforce
     # tenant alignment — a target swap (e.g. pointing at a different
     # model) must still satisfy "route and target share an Org".
+    # ``assert_resource_visible`` collapses missing-row and not-visible
+    # into a single ``ModelRouteTarget not found`` 404, so the caller
+    # can't distinguish "parent route doesn't exist" from "parent route
+    # belongs to another Org".
     parent_route = await ModelRoute.one_by_id(session=session, id=existing.route_id)
-    if parent_route is None:
-        raise NotFoundException(f"ModelRoute with id '{existing.route_id}' not found.")
+    assert_resource_visible(
+        ctx,
+        parent_route,
+        not_found_message=f"ModelRouteTarget with id '{id}' not found.",
+    )
     route_owner_principal_id = parent_route.owner_principal_id
     # don't need to update fallback_status_codes here, handled in set-fallback target
     targets = [
@@ -1027,10 +1119,13 @@ async def update_model_route_target(
     return await ModelRouteTarget.one_by_id(session=session, id=id)
 
 
-@target_router.delete("/{id}")
+@target_router.delete(
+    "/{id}",
+)
 async def delete_model_route_target(
     id: int,
     session: SessionDep,
+    ctx: TenantContextDep,
 ):
     existing = await ModelRouteTarget.one_by_id(
         session=session,
@@ -1039,6 +1134,11 @@ async def delete_model_route_target(
     if not existing or existing.deleted_at is not None:
         raise NotFoundException(f"ModelRouteTarget with id '{id}' not found.")
     route = existing.model_route
+    assert_resource_visible(
+        ctx,
+        route,
+        not_found_message=f"ModelRouteTarget with id '{id}' not found.",
+    )
     try:
         await existing.delete(session=session, auto_commit=False)
         if route:
@@ -1060,6 +1160,7 @@ async def delete_model_route_target(
 async def set_fallback_target(
     id: int,
     session: SessionDep,
+    ctx: TenantContextDep,
     input: SetFallbackTargetInput,
 ):
     existing = await ModelRouteTarget.one_by_id(
@@ -1068,6 +1169,11 @@ async def set_fallback_target(
     )
     if not existing or existing.deleted_at is not None:
         raise NotFoundException(f"ModelRouteTarget with id '{id}' not found.")
+    assert_resource_visible(
+        ctx,
+        existing.model_route,
+        not_found_message=f"ModelRouteTarget with id '{id}' not found.",
+    )
     if existing.fallback_status_codes == input.fallback_status_codes:
         return existing
     try:
@@ -1240,10 +1346,11 @@ async def _replace_route_principals(
 
 
 @router.get("/{id}/access", response_model=ModelAuthorizationList)
-async def get_model_authorization_list(session: SessionDep, id: int):
+async def get_model_authorization_list(
+    session: SessionDep, ctx: TenantContextDep, id: int
+):
     model: ModelRoute = await ModelRoute.one_by_id(session, id)
-    if not model:
-        raise NotFoundException(message="Model not found")
+    assert_resource_visible(ctx, model, not_found_message="Model not found")
 
     return ModelAuthorizationList(
         items=await _list_route_users(session, id),
@@ -1252,13 +1359,18 @@ async def get_model_authorization_list(session: SessionDep, id: int):
     )
 
 
-@router.post("/{id}/access", response_model=ModelAuthorizationList)
+@router.post(
+    "/{id}/access",
+    response_model=ModelAuthorizationList,
+)
 async def add_model_authorization(
-    session: SessionDep, id: int, access_request: ModelAuthorizationUpdate
+    session: SessionDep,
+    ctx: TenantContextDep,
+    id: int,
+    access_request: ModelAuthorizationUpdate,
 ):
     model = await ModelRoute.one_by_id(session, id)
-    if not model:
-        raise NotFoundException(message="Model not found")
+    assert_resource_visible(ctx, model, not_found_message="Model not found")
 
     # Two mutually exclusive grant surfaces (else = "don't touch grants",
     # e.g. a plain policy switch):
@@ -1367,6 +1479,7 @@ async def get_my_models(
         user_id=user_id,
         ctx=ctx,
         include_grants=user.is_admin,
+        include_owner_prefix=True,
     )
 
 
@@ -1390,4 +1503,5 @@ async def get_my_model(
         target_class=target_class,
         ctx=ctx,
         include_grants=user.is_admin,
+        include_owner_prefix=True,
     )

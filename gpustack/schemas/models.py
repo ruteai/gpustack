@@ -4,8 +4,8 @@ from enum import Enum
 import hashlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
-from pydantic import BaseModel, ConfigDict, model_validator
-from sqlalchemy import JSON, Column, ForeignKey, Integer
+from pydantic import BaseModel, ConfigDict, field_serializer, model_validator
+from sqlalchemy import JSON, Column, ForeignKey, Integer, UniqueConstraint
 from sqlalchemy.orm import selectinload
 from sqlmodel import Field, Relationship, SQLModel, Text, select
 
@@ -88,7 +88,9 @@ class LoraListEntry(BaseModel):
     """
 
     lora_name: str = Field(..., min_length=1)
-    """Fully-qualified LoRA id in the form "<base_model_name>:<suffix>"."""
+    """Fully-qualified LoRA id in the form "<base_model_name>:<suffix>". The API
+    strips the prefix on the way out (see ModelPublic._strip_lora_prefix), so
+    clients only ever see/enter the bare short name."""
 
     lora_repo_name: Optional[str] = None
     """HuggingFace repo id, ModelScope model id, or absolute filesystem path
@@ -214,7 +216,7 @@ class SpeculativeConfig(BaseModel):
 
 
 class ModelSpecBase(SQLModel, ModelSource):
-    name: str = Field(index=True, unique=True)
+    name: str = Field(index=True)
     description: Optional[str] = Field(
         sa_type=Text,
         nullable=True,
@@ -290,6 +292,13 @@ class ModelBase(ModelSpecBase):
 
 class Model(ModelBase, BaseModelMixin, table=True):
     __tablename__ = 'models'
+    __table_args__ = (
+        # Model names are unique within their owning Org — two Orgs
+        # can each have a "qwen3-0.6b" without colliding.
+        UniqueConstraint(
+            'owner_principal_id', 'name', name='uix_models_name_per_owner'
+        ),
+    )
     id: Optional[int] = Field(default=None, primary_key=True)
 
     instances: list["ModelInstance"] = Relationship(
@@ -349,6 +358,21 @@ class ModelPublic(
     updated_at: datetime
     # Populated only by the detail endpoint; None on list responses.
     has_stale_lora_instances: Optional[bool] = None
+
+    @field_serializer("lora_list")
+    def _strip_lora_prefix(self, lora_list, _info):
+        """Hide the internal "<base>:" prefix; clients only see the short name."""
+        if not lora_list:
+            return lora_list
+        prefix = f"{self.name}:"
+        out = []
+        for entry in lora_list:
+            data = entry.model_dump() if isinstance(entry, BaseModel) else dict(entry)
+            name = data.get("lora_name") or ""
+            if name.startswith(prefix):
+                data["lora_name"] = name[len(prefix) :]
+            out.append(data)
+        return out
 
 
 ModelsPublic = PaginatedList[ModelPublic]

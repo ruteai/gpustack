@@ -11,12 +11,14 @@ from pydantic import ValidationError
 from starlette.responses import StreamingResponse
 
 from gpustack.api.exceptions import (
+    AlreadyExistsException,
     InternalServerErrorException,
     NotFoundException,
     BadRequestException,
 )
 from gpustack.api.tenant import (
     assert_org_owned_writable,
+    cluster_scoped_system,
     validate_owner_principal,
 )
 from gpustack.schemas import Worker
@@ -514,9 +516,13 @@ def _hybrid_backend_conditions(ctx) -> List:
     Org rows are visible to:
     - their own Org's members (current_principal_id matches)
     - platform admin in "All" mode (no current_principal_id) — full bypass
-    - system principals (worker / cluster service accounts) — full bypass,
-      since they need every Org's overrides to actually run a deploy
-      whose backend version was customised at the Org level
+    - cluster-bound system principals (worker / cluster service
+      accounts) — Platform rows plus the cluster's owner Org's rows.
+      Model deployments aren't shared across Orgs (cluster_access
+      sharing serves GPU instances), so the owner Org is the only Org
+      whose backend overrides this cluster ever serves.
+    - the legacy ``config.token`` system principal (no cluster
+      linkage) — full bypass
     Platform admin in act-as mode (current_principal_id is set) follows the
     same scope as a non-admin caller in that Org: Platform NULL +
     that Org's rows only. They DON'T see other Orgs' rows while
@@ -524,11 +530,19 @@ def _hybrid_backend_conditions(ctx) -> List:
     """
     if ctx is None:
         return []
+    from sqlalchemy import or_
+
+    if cluster_scoped_system(ctx):
+        return [
+            or_(
+                InferenceBackend.owner_principal_id.is_(None),
+                InferenceBackend.owner_principal_id == ctx.scoped_cluster_owner_id,
+            )
+        ]
     if ctx.user is not None and ctx.user.kind == PrincipalType.SYSTEM:
         return []
     if ctx.is_platform_admin and ctx.current_principal_id is None:
         return []
-    from sqlalchemy import or_
 
     or_clauses = [InferenceBackend.owner_principal_id.is_(None)]
     if ctx.current_principal_id is not None:
@@ -622,23 +636,24 @@ def _collapse_by_backend_name(
         # `existing` is the public copy of whatever we saw first; `backend`
         # is the new ORM row. Decide which side is the Org row and merge.
         if backend.owner_principal_id is not None:
-            org_versions = backend.version_configs
-            other_versions = existing.version_configs
-            org_enabled = bool(backend.enabled)
-            other_enabled = bool(existing.enabled)
-            target = InferenceBackendPublic(**backend.model_dump())
+            org_row = backend
+            platform_row = existing
+            target = InferenceBackendPublic(**org_row.model_dump())
         else:
-            org_versions = existing.version_configs
-            other_versions = backend.version_configs
-            org_enabled = bool(existing.enabled)
-            other_enabled = bool(backend.enabled)
-            target = existing
+            org_row = existing
+            platform_row = backend
+            target = org_row
         merged_versions = {
-            **(other_versions.root if other_versions else {}),
-            **(org_versions.root if org_versions else {}),
+            **(
+                platform_row.version_configs.root
+                if platform_row.version_configs
+                else {}
+            ),
+            **(org_row.version_configs.root if org_row.version_configs else {}),
         }
         target.version_configs = VersionConfigDict(root=merged_versions)
-        target.enabled = org_enabled or other_enabled
+        target.enabled = bool(org_row.enabled) or bool(platform_row.enabled)
+        target.icon = platform_row.icon
         by_name[backend.backend_name] = target
     return list(by_name.values())
 
@@ -669,8 +684,19 @@ async def merge_runner_versions_to_db(
     # independently). Admin act-as mode behaves like the Org member —
     # they're acting *inside* that Org and want the collapsed
     # single-card UX too.
-    is_admin_view = ctx is None or (
-        ctx.is_platform_admin and ctx.current_principal_id is None
+    # System principals (worker / cluster service accounts) also get
+    # uncollapsed rows: they serve deploys for every Org and resolve
+    # the Platform-vs-Org scope per model themselves — collapsing all
+    # Orgs' rows into one entry here would lose that scoping.
+    is_system = (
+        ctx is not None
+        and ctx.user is not None
+        and ctx.user.kind == PrincipalType.SYSTEM
+    )
+    is_admin_view = (
+        ctx is None
+        or is_system
+        or (ctx.is_platform_admin and ctx.current_principal_id is None)
     )
     if is_admin_view:
         publics = [
@@ -773,7 +799,6 @@ def _filter_community_backends(
 
 @router.get("", response_model=InferenceBackendsPublic)
 async def get_inference_backends(  # noqa: C901
-    session: SessionDep,
     ctx: TenantContextDep,
     params: ListParamsDep,
     search: str = None,
@@ -785,7 +810,6 @@ async def get_inference_backends(  # noqa: C901
     Get paginated list of inference backends with optional search and filters.
 
     Args:
-        session: Database session
         params: List parameters (page, perPage, watch, sort_by)
         search: Search keyword for backend_name and description
         include_deprecated: Include deprecated versions
@@ -804,14 +828,17 @@ async def get_inference_backends(  # noqa: C901
                 ctx.is_platform_admin and ctx.current_principal_id is None
             ):
                 return True
-            # System principals (worker / cluster) need every Org's
-            # overrides because they actually run the deploys.
-            if (
-                getattr(ctx, "user", None) is not None
-                and ctx.user.kind == PrincipalType.SYSTEM
-            ):
+            org_id = b.owner_principal_id
+            # Cluster-bound service accounts (worker / cluster
+            # bootstrap) serve only their cluster's owner Org, so
+            # Platform rows + that Org's rows suffice — mirrors
+            # _hybrid_backend_conditions.
+            if cluster_scoped_system(ctx):
+                return org_id is None or org_id == ctx.scoped_cluster_owner_id
+            # The legacy config.token system principal has no cluster
+            # linkage and keeps the full cross-Org stream.
+            if ctx.user is not None and ctx.user.kind == PrincipalType.SYSTEM:
                 return True
-            org_id = getattr(b, "owner_principal_id", None)
             if org_id is None:
                 return True
             return (
@@ -1057,8 +1084,8 @@ async def create_inference_backend(
         },
     )
     if existing:
-        raise BadRequestException(
-            message=f"Inference backend with name '{backend_in.backend_name}' already exists",
+        raise AlreadyExistsException(
+            message=f"Inference backend with name '{backend_in.backend_name}' already exists.",
         )
 
     # Validate version names for custom backends before creating
@@ -1143,6 +1170,7 @@ async def _redirect_global_edit_to_org_row(
         backend_source=backend.backend_source,
         parameter_format=backend_in.parameter_format,
         common_parameters=backend_in.common_parameters,
+        icon=backend.icon,
         owner_principal_id=ctx.current_principal_id,
     )
     return await InferenceBackend.create(session, new_row)
@@ -1338,8 +1366,8 @@ async def create_inference_backend_from_yaml(  # noqa: C901
             },
         )
         if existing:
-            raise BadRequestException(
-                message=f"Inference backend with name '{req_yaml_data['backend_name']}' already exists",
+            raise AlreadyExistsException(
+                message=f"Inference backend with name '{req_yaml_data['backend_name']}' already exists.",
             )
 
         allowed_keys = [

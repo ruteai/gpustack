@@ -4,12 +4,14 @@ from typing import List
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy.orm import aliased
 from sqlmodel import select
 
 from gpustack.api.exceptions import (
     AlreadyExistsException,
     ForbiddenException,
     InternalServerErrorException,
+    InvalidException,
     NotFoundException,
     ConflictException,
 )
@@ -24,6 +26,7 @@ from gpustack.schemas.principals import (
 from gpustack.server.db import async_session
 from gpustack.server.deps import CurrentUserDep, SessionDep, TenantContextDep
 from gpustack.schemas.users import (
+    AuthProviderEnum,
     User,
     UserActivationUpdate,
     UserCreate,
@@ -33,10 +36,33 @@ from gpustack.schemas.users import (
     UsersPublic,
     UserSelfUpdate,
 )
-from gpustack.server.passwords import set_password
+from gpustack.server.passwords import (
+    is_password_change_required,
+    password_change_required_map,
+    set_password,
+)
 from gpustack.server.services import UserService
 
 router = APIRouter()
+
+
+async def _to_user_public(session, user: User) -> UserPublic:
+    # ``require_password_change`` lives on the ``user_passwords`` row,
+    # not on the Principal — hydrate it here so the wire response
+    # reflects the actual force-change state.
+    result = UserPublic.model_validate(user)
+    result.require_password_change = await is_password_change_required(session, user.id)
+    return result
+
+
+async def _to_users_public(session, page) -> UsersPublic:
+    flag_map = await password_change_required_map(session, [u.id for u in page.items])
+    items = []
+    for u in page.items:
+        item = UserPublic.model_validate(u)
+        item.require_password_change = flag_map.get(u.id, False)
+        items.append(item)
+    return UsersPublic(items=items, pagination=page.pagination)
 
 
 class UserMembership(BaseModel):
@@ -62,7 +88,7 @@ async def get_users(
         )
 
     async with async_session() as session:
-        return await User.paginated_by_query(
+        page = await User.paginated_by_query(
             session=session,
             fuzzy_fields=fuzzy_fields,
             page=params.page,
@@ -73,6 +99,7 @@ async def get_users(
             },
             order_by=params.order_by,
         )
+        return await _to_users_public(session, page)
 
 
 @router.get("/{id}", response_model=UserPublic)
@@ -80,7 +107,7 @@ async def get_user(session: SessionDep, id: int):
     user = await User.one_by_id(session, id)
     if not user:
         raise NotFoundException(message="User not found")
-    return user
+    return await _to_user_public(session, user)
 
 
 @router.get("/{id}/memberships", response_model=List[UserMembership])
@@ -133,7 +160,26 @@ async def create_user(session: SessionDep, user_in: UserCreate):
         )
     ).first()
     if existing:
-        raise AlreadyExistsException(message=f"User {user_in.username} already exists")
+        raise AlreadyExistsException(
+            message=f"User with name '{user_in.username}' already exists."
+        )
+
+    # A local password on a non-Local user is a /login bypass around
+    # the IdP — ``authenticate_user`` only checks the password hash.
+    source = user_in.source if user_in.source is not None else AuthProviderEnum.Local
+    if source == AuthProviderEnum.Local and not user_in.password:
+        raise InvalidException(message="Password is required for Local users.")
+    if source != AuthProviderEnum.Local and user_in.password:
+        raise InvalidException(
+            message=f"Password must not be set for {source.value} users."
+        )
+    if source != AuthProviderEnum.Local and user_in.require_password_change:
+        raise InvalidException(
+            message=(
+                f"require_password_change is not applicable to "
+                f"{source.value} users."
+            )
+        )
 
     try:
         to_create = User(
@@ -141,6 +187,7 @@ async def create_user(session: SessionDep, user_in: UserCreate):
             display_name=user_in.full_name,
             is_admin=user_in.is_admin,
             is_active=user_in.is_active,
+            source=source,
         )
         # Admin additionally joins the platform Org as OWNER; regular
         # users do NOT auto-join — admin can add them later if shared
@@ -172,7 +219,7 @@ async def create_user(session: SessionDep, user_in: UserCreate):
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to create user: {e}")
 
-    return user
+    return await _to_user_public(session, user)
 
 
 @router.put("/{id}", response_model=UserPublic)
@@ -187,6 +234,19 @@ async def update_user(session: SessionDep, id: int, user_in: UserUpdate):
         and await is_only_admin_user(session, user)
     ):
         raise ConflictException(message="Cannot deactivate the only admin user")
+
+    # See the guard in :func:`create_user` — same /login bypass.
+    if user.source != AuthProviderEnum.Local and user_in.password:
+        raise InvalidException(
+            message=f"Password must not be set for {user.source.value} users."
+        )
+    if user.source != AuthProviderEnum.Local and user_in.require_password_change:
+        raise InvalidException(
+            message=(
+                f"require_password_change is not applicable to "
+                f"{user.source.value} users."
+            )
+        )
 
     try:
         # ``exclude_none=True`` so omitting an optional field (e.g.
@@ -216,7 +276,7 @@ async def update_user(session: SessionDep, id: int, user_in: UserUpdate):
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to update user: {e}")
 
-    return user
+    return await _to_user_public(session, user)
 
 
 @router.patch("/{id}/activation", response_model=UserPublic)
@@ -233,7 +293,7 @@ async def update_user_activation(
 
     changed = user.is_active != activation_data.is_active
     if not changed:
-        return user
+        return await _to_user_public(session, user)
 
     if (
         user.is_active
@@ -251,7 +311,7 @@ async def update_user_activation(
             message=f"Failed to update user activation: {e}"
         )
 
-    return user
+    return await _to_user_public(session, user)
 
 
 @router.delete("/{id}")
@@ -287,14 +347,20 @@ me_router = APIRouter()
 
 
 @me_router.get("/me", response_model=UserPublic)
-async def get_user_me(user: CurrentUserDep):
-    return user
+async def get_user_me(session: SessionDep, user: CurrentUserDep):
+    return await _to_user_public(session, user)
 
 
 @me_router.put("/me", response_model=UserPublic)
 async def update_user_me(
     session: SessionDep, user: CurrentUserDep, user_in: UserSelfUpdate
 ):
+    # See the guard in :func:`create_user` — same /login bypass.
+    if user.source != AuthProviderEnum.Local and user_in.password:
+        raise InvalidException(
+            message=f"Password must not be set for {user.source.value} users."
+        )
+
     try:
         update_data = user_in.model_dump(exclude_none=True)
         if "full_name" in update_data:
@@ -306,7 +372,7 @@ async def update_user_me(
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to update user: {e}")
 
-    return user
+    return await _to_user_public(session, user)
 
 
 # User-search endpoint accessible to org owners (any) and platform
@@ -321,16 +387,30 @@ async def list_user_directory(
     page: int = 1,
     perPage: int = 30,
     search: str = None,
+    # ``scope=current_org`` narrows results to USER principals that are
+    # members of the request's current Org (directly or via a Group
+    # joined to that Org). Used by pickers whose surrounding list is
+    # already Org-scoped (e.g. the API keys "Filter by creator" select)
+    # so the picker options match the rows the user can actually see.
+    # Silently ignored when the request has no Org context — platform
+    # admins in "All orgs" mode keep getting the full directory.
+    scope: str = None,
 ):
     if not ctx.is_platform_admin and ctx.org_role != OrgRole.OWNER:
         raise ForbiddenException(message="Insufficient permission")
     fuzzy_fields = {}
     if search:
         fuzzy_fields = {"name": search, "display_name": search}
+    extra_conditions = []
+    if scope == "current_org" and ctx.has_org_context:
+        extra_conditions.append(
+            User.id.in_(_org_member_user_ids_subquery(ctx.current_principal_id))
+        )
     async with async_session() as session:
-        return await User.paginated_by_query(
+        result = await User.paginated_by_query(
             session=session,
             fuzzy_fields=fuzzy_fields,
+            extra_conditions=extra_conditions or None,
             page=page,
             per_page=perPage,
             fields={
@@ -338,3 +418,42 @@ async def list_user_directory(
                 "deleted_at": None,
             },
         )
+        return await _to_users_public(session, result)
+
+
+def _org_member_user_ids_subquery(org_principal_id: int):
+    """USER principal ids reachable as members of an Org.
+
+    Mirrors the two membership paths in
+    :func:`gpustack.api.tenant._resolve_effective_org_role`: a direct
+    ``(parent=org, member=user)`` row, or via a Group that is itself
+    a member of the Org. Soft-deleted rows on either hop are excluded.
+    """
+    direct = (
+        select(PrincipalMembership.member_principal_id)
+        .join(
+            Principal,
+            Principal.id == PrincipalMembership.member_principal_id,
+        )
+        .where(
+            PrincipalMembership.parent_principal_id == org_principal_id,
+            PrincipalMembership.deleted_at.is_(None),
+            Principal.kind == PrincipalType.USER,
+            Principal.deleted_at.is_(None),
+        )
+    )
+    org_pm = aliased(PrincipalMembership)
+    group_pm = aliased(PrincipalMembership)
+    via_group = (
+        select(group_pm.member_principal_id)
+        .join(org_pm, org_pm.member_principal_id == group_pm.parent_principal_id)
+        .join(Principal, Principal.id == group_pm.parent_principal_id)
+        .where(
+            org_pm.parent_principal_id == org_principal_id,
+            org_pm.deleted_at.is_(None),
+            group_pm.deleted_at.is_(None),
+            Principal.kind == PrincipalType.GROUP,
+            Principal.deleted_at.is_(None),
+        )
+    )
+    return direct.union_all(via_group)

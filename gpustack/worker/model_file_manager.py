@@ -299,6 +299,8 @@ class ModelFileDownloadTask:
         # Store download log file paths for related model instances
         self._instance_download_log_file = None
         self._download_completed = False
+        # One-shot guard for the finalize note.
+        self._finalizing_logged = False
         # Time control for log updates
         self._last_log_update_time = 0
         self._log_update_interval = 2.0  # 2 seconds interval
@@ -519,21 +521,29 @@ class ModelFileDownloadTask:
                 state_message=str(e),
             )
 
-    def _validate_lora_adapter_config(self, model_paths) -> Optional[str]:
-        """Return error message if LoRA adapter_config is missing or mismatched."""
-        if not getattr(self._model_file, "is_lora", False):
-            return None
+    def _read_lora_adapter_config(self, model_paths) -> Optional[dict]:
+        """Return parsed adapter_config.json as a dict, or None when the file is absent.
+
+        Presence of adapter_config.json is the authoritative marker of a PEFT LoRA
+        (the only LoRA form vLLM/SGLang/Ascend MindIE serve). Raises ValueError when the
+        file is present but cannot be parsed into a JSON object.
+        """
         if not model_paths:
-            return "Empty resolved_paths for LoRA"
-        root = Path(model_paths[0])
-        cfg_path = root / "adapter_config.json"
+            return None
+        cfg_path = Path(model_paths[0]) / "adapter_config.json"
         if not cfg_path.is_file():
-            return "adapter_config.json not found in LoRA directory"
+            return None
         try:
             data = json.loads(cfg_path.read_text(encoding="utf-8"))
         except Exception as e:
-            return f"Invalid adapter_config.json: {e}"
-        base = data.get("base_model_name_or_path") or data.get("base_model_name")
+            raise ValueError(f"Invalid adapter_config.json: {e}") from e
+        if not isinstance(data, dict):
+            raise ValueError("adapter_config.json is not a JSON object")
+        return data
+
+    def _validate_lora_base_model(self, cfg: dict) -> Optional[str]:
+        """Return error if the adapter's base model mismatches the expected base_model."""
+        base = cfg.get("base_model_name_or_path") or cfg.get("base_model_name")
         expected = (getattr(self._model_file, "base_model", None) or "").strip()
         if expected and base:
             nb = str(base).strip().strip("/").lower()
@@ -552,6 +562,60 @@ class ModelFileDownloadTask:
             )
         return None
 
+    def _fail_lora_resolution(self, message: str) -> None:
+        """Mark the model file ERROR for a LoRA problem and signal the caller to abort."""
+        self._update_model_file(
+            self._model_file.id,
+            state=ModelFileStateEnum.ERROR,
+            state_message=message,
+        )
+        self._write_to_instance_download_logs(
+            f"LoRA adapter validation failed: {message}",
+            is_error=True,
+        )
+        return None
+
+    def _resolve_lora_state(self, model_paths) -> Optional[dict]:
+        """Resolve is_lora for the downloaded artifact and return READY-update extras.
+
+        Returns the extra kwargs to merge into the READY update (``{}`` when not a LoRA),
+        or ``None`` when an ERROR state was already reported, in which case the caller
+        must abort.
+
+        is_lora is an objective property of the artifact (presence of adapter_config.json),
+        so backend detection is authoritative. The user-provided is_lora is kept only as an
+        override hint for detection false-negatives: final = detected or user_hint.
+        """
+        user_hint_lora = self._model_file.is_lora
+        try:
+            cfg = self._read_lora_adapter_config(model_paths)
+        except ValueError as e:
+            return self._fail_lora_resolution(str(e))
+        detected_lora = cfg is not None
+        self._model_file.is_lora = detected_lora or user_hint_lora
+
+        if not self._model_file.is_lora:
+            return {}
+
+        if detected_lora:
+            # Detected by adapter_config.json: validate strictly, backfill base_model.
+            err = self._validate_lora_base_model(cfg)
+            if err:
+                return self._fail_lora_resolution(err)
+            if not self._model_file.base_model:
+                self._model_file.base_model = cfg.get(
+                    "base_model_name_or_path"
+                ) or cfg.get("base_model_name")
+        else:
+            # User override with no adapter_config.json at the probe path: trust the
+            # user (likely a detection false-negative), skip path-based validation.
+            logger.info(
+                f"is_lora forced by user input for {self._model_file.readable_source}; "
+                "adapter_config.json not detected at resolved path."
+            )
+
+        return {"is_lora": True, "base_model": self._model_file.base_model}
+
     def _download_model_file(self):
         self._write_to_instance_download_logs(
             f"Downloading model file: {self._model_file.readable_source}"
@@ -564,25 +628,18 @@ class ModelFileDownloadTask:
             huggingface_token=self._config.huggingface_token,
         )
         self._download_completed = True
-        if self._model_file.is_lora:
-            err = self._validate_lora_adapter_config(model_paths)
-            if err:
-                self._update_model_file(
-                    self._model_file.id,
-                    state=ModelFileStateEnum.ERROR,
-                    state_message=err,
-                )
-                self._write_to_instance_download_logs(
-                    f"LoRA adapter validation failed: {err}",
-                    is_error=True,
-                )
-                return
+
+        extra = self._resolve_lora_state(model_paths)
+        if extra is None:
+            # Validation failed; ERROR state already reported by _resolve_lora_state.
+            return
 
         self._update_model_file(
             self._model_file.id,
             state=ModelFileStateEnum.READY,
             download_progress=100,
             resolved_paths=model_paths,
+            **extra,
         )
         self._write_to_instance_download_logs(
             f"Successfully downloaded {self._model_file.readable_source}"
@@ -665,11 +722,33 @@ class ModelFileDownloadTask:
 
         with self._speed_lock:
             self._model_downloaded_size += n
+            # Bytes done but download_model not yet returned (finalize phase).
+            reached_full = (
+                not self._finalizing_logged
+                and self._model_file_size is not None
+                and self._model_file_size > 0
+                and self._model_downloaded_size >= self._model_file_size
+            )
+            if reached_full:
+                self._finalizing_logged = True
+
+        if reached_full:
+            self._write_finalize_note(
+                "All files downloaded. Finalizing (assembling/verifying)... "
+                "progress holds at 99% until finalization completes."
+            )
 
         try:
-            # Update overall progress
-            progress = round(
-                (self._model_downloaded_size / self._model_file_size) * 100, 2
+            # Cap at 99% until download_model returns; READY sets the real 100%.
+            progress = min(
+                (
+                    round(
+                        (self._model_downloaded_size / self._model_file_size) * 100, 2
+                    )
+                    if self._model_file_size
+                    else 0.0
+                ),
+                99.0,
             )
 
             # Update individual file progress using ANSI cursor positioning
@@ -852,6 +931,22 @@ class ModelFileDownloadTask:
         self._write_to_instance_download_logs(
             f"\033[{line_num};1H", use_tqdm_format=True  # Move cursor to end of file
         )
+
+    def _write_finalize_note(self, message: str):
+        """Write a one-line note on the line below the per-file progress block.
+
+        Uses absolute cursor positioning like the per-file writers, so it does
+        not touch _log_header_lines or clobber the ANSI-rendered file lines.
+        """
+        if not self._instance_download_log_file:
+            return
+        max_line_number = (
+            max(self._file_line_mapping.values()) if self._file_line_mapping else 0
+        )
+        line_num = max_line_number + self._log_header_lines + 1
+        timestamp = time.strftime('%H:%M:%S')
+        ansi_message = f"\033[{line_num};1H\033[2K[{timestamp}] {message}\n"
+        self._write_to_instance_download_logs(ansi_message, use_tqdm_format=True)
 
     def _ensure_model_file_size_and_paths(self):
         if self._model_file.size is not None:

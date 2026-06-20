@@ -13,7 +13,7 @@ from gpustack_runtime.detector import ManufacturerEnum
 
 
 _DEFAULT_OPERATOR_IMAGE = f"gpustack/gpustack-operator:{__operator_version__}"
-_DEFAULT_OPERATOR_NAMESPACE = "gpustack"
+_DEFAULT_CONTAINER_NAMESPACE = "gpustack"
 _DEFAULT_CLUSTER_NAMESPACE = "gpustack-system"
 
 
@@ -37,10 +37,11 @@ _MANUFACTURER_PCI_ID: Dict[ManufacturerEnum, str] = {
     ManufacturerEnum.THEAD: "1ded",
 }
 _PCI_NODE_LABEL = "feature.node.kubernetes.io/pci-{pci_id}.present"
-# Canonical, request-order-independent runtime ordering. Drives which runtime
-# owns the legacy ``gpustack-worker`` DaemonSet name (the first one) so the
-# rendered DaemonSet set is stable for a given set of runtimes regardless of
-# the order they were requested in.
+# Node label that identifies non-acceleratable (CPU-only) nodes.
+_CPU_NODE_LABEL = "feature.gpustack.ai/acceleratable"
+# Canonical, request-order-independent runtime ordering. Used for deterministic
+# output ordering of GPU vendor DaemonSets regardless of the order they were
+# requested in.
 _RUNTIME_ORDER: Dict[ManufacturerEnum, int] = {
     runtime: index for index, runtime in enumerate(_MANUFACTURER_PCI_ID)
 }
@@ -61,11 +62,9 @@ class ImagePullSecretRenderSpec(BaseModel):
 
 class WorkerRenderSpec(BaseModel):
     """
-    Per-DaemonSet render data, one entry per requested GPU runtime. The first
-    runtime in canonical order keeps the legacy ``gpustack-worker`` name so an
-    existing single-vendor cluster updates in place without a DaemonSet
-    selector mutation; every other runtime gets a ``gpustack-worker-<runtime>``
-    name.
+    Per-DaemonSet render data. One entry is always produced for the CPU worker
+    (named ``gpustack-worker``), plus one entry per requested GPU runtime
+    (each named ``gpustack-worker-<runtime>``).
 
     The grouping mirrors how Helm chart values are typically organized
     (``.Values.worker.*``), so a future chart migration maps 1:1 onto these
@@ -102,11 +101,18 @@ class TemplateConfig(ClusterRegistrationTokenPublic):
     # daemonset.jinja imagePullSecrets reference iterate this list, so the
     # Secret name is the single source of truth.
     image_pull_secrets: List[ImagePullSecretRenderSpec] = []
-    # True when 2+ distinct GPU runtimes are requested. Adds the multi-DS
-    # safety net (per-pod ``app.kubernetes.io/component``/``gpustack.io/runtime``
-    # labels + cross-DS podAntiAffinity so at most one worker pod lands per
-    # node). Single-runtime output stays label-minimal and affinity-free.
-    multi_vendor_mode: bool = False
+
+    @computed_field
+    @property
+    def multi_vendor_mode(self) -> bool:
+        """
+        True when 2+ worker DaemonSets are rendered (CPU + any GPU vendor, or
+        2+ GPU vendors). Adds the multi-DS safety net (per-pod
+        ``app.kubernetes.io/component``/``gpustack.io/runtime`` labels +
+        cross-DS podAntiAffinity so at most one worker pod lands per node).
+        Single-worker output stays label-minimal and affinity-free.
+        """
+        return len(self.workers) >= 2
 
     @computed_field
     @property
@@ -145,24 +151,35 @@ class TemplateConfig(ClusterRegistrationTokenPublic):
 
     @computed_field
     @property
-    def operator_container_namespace(self) -> Optional[str]:
+    def container_namespace(self) -> Optional[str]:
         """
-        Namespace segment inferred from the resolved operator image — used by
+        Namespace segment inferred from the resolved gpustack image — used by
         the operator runtime (``GPUSTACK_CONTAINER_NAMESPACE``) to compose
-        sibling image references. Strip the cluster registry prefix first so
-        the leading segment isn't mistaken for a namespace, then take
-        everything up to the final ``/``. Suppressed when the namespace is
-        the built-in ``gpustack`` default since the operator already knows
-        that one.
+        sibling image references. The operator image may live elsewhere, so the
+        namespace must come from the gpustack image (``self.image``) instead.
+
+        Strip the registry prefix first so the leading segment isn't mistaken
+        for a namespace, then take everything up to the final ``/`` (the
+        trailing ``<name>:<tag>`` segment is discarded). The registry can be
+        either the configured ``system_default_container_registry`` or one
+        embedded directly in the reference (e.g. via an ``image_name_override``
+        like ``quay.io/gpustack/gpustack:dev``); the latter is detected with
+        the same heuristic as ``apply_registry_override_to_image`` — the first
+        path segment is a registry when it contains ``.`` or ``:`` or equals
+        ``localhost``. Suppressed when the namespace is the built-in
+        ``gpustack`` default since the operator already knows that one.
         """
-        image = self.operator_image
+        image = self.image
         registry = (self.system_default_container_registry or "").strip().rstrip("/")
         if registry and image.startswith(registry + "/"):
             image = image[len(registry) + 1 :]
+        first, sep, rest = image.partition("/")
+        if sep and ("." in first or ":" in first or first == "localhost"):
+            image = rest
         if "/" not in image:
             return None
         namespace = image.rsplit("/", 1)[0]
-        if namespace == _DEFAULT_OPERATOR_NAMESPACE:
+        if namespace == _DEFAULT_CONTAINER_NAMESPACE:
             return None
         return namespace
 
@@ -177,6 +194,22 @@ class TemplateConfig(ClusterRegistrationTokenPublic):
             return (
                 self.k8s_options.gpu_instance_options.gpu_instances_access_static_address
             )
+        return None
+
+    @computed_field
+    @property
+    def operator_env(self) -> Optional[Dict[str, str]]:
+        """
+        Extra env vars for the operator container, sourced from
+        ``k8s_options.operator.env``. Returns None when no extra env vars
+        are configured.
+        """
+        if (
+            self.k8s_options
+            and self.k8s_options.operator
+            and self.k8s_options.operator.env
+        ):
+            return self.k8s_options.operator.env
         return None
 
     def render(self) -> str:
@@ -283,7 +316,7 @@ class TemplateConfig(ClusterRegistrationTokenPublic):
         gpu_runtimes: List[ManufacturerEnum] = []
         for r in self.runtimes or []:
             # UNKNOWN is the "no GPU detected" sentinel — never gets its own
-            # worker DaemonSet.
+            # GPU worker DaemonSet.
             if r == ManufacturerEnum.UNKNOWN:
                 continue
             if r in seen:
@@ -291,43 +324,40 @@ class TemplateConfig(ClusterRegistrationTokenPublic):
             seen.add(r)
             gpu_runtimes.append(r)
 
-        # Order the DaemonSets by a fixed canonical runtime order rather than
-        # the request order. The first runtime keeps the legacy
-        # ``gpustack-worker`` name, and a DaemonSet's selector (app: <ds_name>)
-        # is immutable — so deriving "first" from request order would let a
-        # reordered request shuffle which vendor owns ``gpustack-worker`` and
-        # churn pods. The canonical order makes the rendered name set
-        # deterministic for a given set of runtimes.
+        # Order the GPU DaemonSets by a fixed canonical runtime order rather
+        # than the request order. The canonical order makes the rendered output
+        # deterministic for a given set of runtimes regardless of the order they
+        # were requested in.
         gpu_runtimes.sort(key=lambda r: _RUNTIME_ORDER.get(r, len(_RUNTIME_ORDER)))
-
-        self.multi_vendor_mode = len(gpu_runtimes) >= 2
-
-        # No GPU runtime requested → no worker DaemonSet at all.
-        if not gpu_runtimes:
-            return []
 
         base_node_selector = (
             self.k8s_options.node_selector if self.k8s_options is not None else None
         )
 
         workers: List[WorkerRenderSpec] = []
-        for index, runtime in enumerate(gpu_runtimes):
-            # First runtime (canonical order) keeps the legacy
-            # ``gpustack-worker`` name so an existing single-vendor cluster
-            # updates in place; the rest get a runtime-suffixed name.
-            ds_name = (
-                WORKER_DS_BASENAME
-                if index == 0
-                else f"{WORKER_DS_BASENAME}-{runtime.value}"
+
+        # Always render the CPU DaemonSet first. It owns the legacy
+        # ``gpustack-worker`` name.
+        workers.append(
+            WorkerRenderSpec(
+                name="cpu",
+                ds_name=WORKER_DS_BASENAME,
+                runtime="",
+                node_selector=_cpu_node_selector_for(base_node_selector),
             )
+        )
+
+        # All GPU vendor DaemonSets get a runtime-suffixed name.
+        for runtime in gpu_runtimes:
             workers.append(
                 WorkerRenderSpec(
                     name=runtime.value,
-                    ds_name=ds_name,
+                    ds_name=f"{WORKER_DS_BASENAME}-{runtime.value}",
                     runtime=runtime.value,
                     node_selector=_node_selector_for(runtime, base_node_selector),
                 )
             )
+
         return workers
 
 
@@ -346,3 +376,17 @@ def _node_selector_for(
     if pci_id:
         selector[_PCI_NODE_LABEL.format(pci_id=pci_id)] = "true"
     return selector or None
+
+
+def _cpu_node_selector_for(
+    base: Optional[Dict[str, str]],
+) -> Dict[str, str]:
+    """
+    Merge the cluster-level base ``nodeSelector`` with the CPU node label
+    (``feature.gpustack.ai/acceleratable: "false"``) so the DaemonSet only
+    schedules onto non-acceleratable (CPU-only) nodes. No NFD PCI labels are
+    added. Base keys lose to the CPU label on collision.
+    """
+    selector: Dict[str, str] = dict(base or {})
+    selector[_CPU_NODE_LABEL] = "false"
+    return selector

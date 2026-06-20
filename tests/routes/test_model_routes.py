@@ -1,5 +1,9 @@
+import asyncio
+import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import true
@@ -11,11 +15,15 @@ from gpustack.schemas.common import Pagination
 from gpustack.schemas.model_routes import (
     AccessPolicyEnum,
     ModelRoute,
+    ModelRouteCreate,
     ModelRouteListParams,
+    ModelRoutePublic,
     ModelRoutesPublic,
     MyModel,
 )
+from gpustack.schemas.models import SourceEnum
 from gpustack.schemas.principals import Principal, PrincipalType
+import gpustack.server.lora_adapters_discovery as discovery
 
 
 def _ctx(
@@ -79,6 +87,108 @@ async def test_get_model_routes_filters_categories_on_target_class(monkeypatch):
     assert captured["categories"] == ["image"]
     assert captured["fields"]["user_id"] == 123
     assert captured["extra_conditions"]
+
+
+@pytest.mark.asyncio
+async def test_apply_effective_name_to_my_models_prefixes_by_owner(monkeypatch):
+    """Items get rewritten in place: platform Org's route stays bare,
+    non-platform Orgs prefix with the owner's ``name``. This is what
+    lets the My Models page render and Open-in-Playground submit the
+    OpenAI-style id even for cross-Org grants (granting Org isn't in
+    the caller's client-side cache, but the server has it)."""
+    monkeypatch.setattr(model_routes, "platform_principal_id", lambda: 1)
+
+    items = [
+        SimpleNamespace(name="qwen3-0.6b", owner_principal_id=1),
+        SimpleNamespace(name="qwen3-0.6b", owner_principal_id=2),
+        SimpleNamespace(name="bge-m3", owner_principal_id=3),
+    ]
+
+    session = SimpleNamespace()
+    exec_result = MagicMock()
+    exec_result.all.return_value = [(2, "alpha"), (3, "beta")]
+    session.exec = AsyncMock(return_value=exec_result)
+
+    await model_routes._apply_effective_name_to_my_models(session, items, enabled=True)
+
+    assert items[0].name == "qwen3-0.6b"  # platform Org → no prefix
+    assert items[1].name == "alpha/qwen3-0.6b"
+    assert items[2].name == "beta/bge-m3"
+
+
+@pytest.mark.asyncio
+async def test_apply_effective_name_to_my_models_skips_when_disabled():
+    """The rewrite is gated by ``enabled``, not the item's class —
+    callers that don't opt in (the management list/get surfaces) leave
+    ``name`` raw and avoid the owner-name lookup round-trip entirely."""
+    session = SimpleNamespace(exec=AsyncMock())
+    item = SimpleNamespace(name="qwen3-0.6b", owner_principal_id=2)
+
+    await model_routes._apply_effective_name_to_my_models(
+        session, [item], enabled=False
+    )
+
+    session.exec.assert_not_called()
+    assert item.name == "qwen3-0.6b"
+
+
+@pytest.mark.asyncio
+async def test_apply_effective_name_to_my_models_prefixes_admin_model_routes(
+    monkeypatch,
+):
+    """When enabled, ``ModelRoute`` rows (the admin ``get_my_models``
+    path) get prefixed just like the non-admin ``MyModel`` view, so a
+    single endpoint returns one consistent ``name`` format for both."""
+    monkeypatch.setattr(model_routes, "platform_principal_id", lambda: 1)
+
+    item = ModelRoute(name="qwen3-0.6b", owner_principal_id=2)
+    session = SimpleNamespace()
+    exec_result = MagicMock()
+    exec_result.all.return_value = [(2, "alpha")]
+    session.exec = AsyncMock(return_value=exec_result)
+
+    await model_routes._apply_effective_name_to_my_models(session, [item], enabled=True)
+
+    assert item.name == "alpha/qwen3-0.6b"
+
+
+def test_model_route_create_rejects_slashed_name():
+    """The no-slash rule must still gate user input on the write path —
+    otherwise a hand-typed ``foo/bar`` would collide with the
+    ``<owner>/<name>`` shape the read path synthesizes."""
+    with pytest.raises(ValueError, match="must start with a letter"):
+        ModelRouteCreate(name="org1/qwen3-0.6b", targets=[])
+
+
+def test_model_route_public_accepts_enriched_slashed_name():
+    """Regression: the My Models response serializes through
+    ``ModelRoutePublic``; once ``_apply_effective_name_to_my_models``
+    rewrites ``name`` to ``<owner>/<name>``, response validation must
+    accept it (the prior inherited validator rejected it with
+    ``Unexpected error occurred: 1 validation error``)."""
+    now = datetime(2026, 6, 7, tzinfo=timezone.utc)
+    public = ModelRoutePublic.model_validate(
+        {
+            "id": 1,
+            "name": "org1/qwen3-0.6b",
+            "owner_principal_id": 6,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    assert public.name == "org1/qwen3-0.6b"
+
+
+@pytest.mark.asyncio
+async def test_apply_effective_name_to_my_models_empty_is_noop():
+    """Empty input must short-circuit before any session query — the
+    helper runs on every MyModel list (including 0-result pages) and a
+    spurious round-trip per page would be a regression."""
+    session = SimpleNamespace(exec=AsyncMock())
+
+    await model_routes._apply_effective_name_to_my_models(session, [], enabled=True)
+
+    session.exec.assert_not_called()
 
 
 def test_assert_target_tenant_aligned_same_org():
@@ -446,3 +556,128 @@ async def test_get_model_routes_admin_act_as_watch_applies_grant_filter(monkeypa
     # AND with the OR predicate and drop PUBLIC/AUTHED + foreign-owned
     # grants entirely.
     assert "owner_principal_id" not in captured["fields"]
+
+
+# ---------------------------------------------------------------------------
+# list_adapters_for_base (backs GET /v2/models/adapters)
+# ---------------------------------------------------------------------------
+
+
+def _adapters_session(model_files):
+    """A session whose exec(...).all() returns the given local ModelFile rows."""
+    session = MagicMock()
+    result = MagicMock()
+    result.all = MagicMock(return_value=model_files)
+    session.exec = AsyncMock(return_value=result)
+    return session
+
+
+def _local_lora(repo_id, base="qwen/qwen3-8b"):
+    model_file = MagicMock()
+    model_file.source = SourceEnum.HUGGING_FACE
+    model_file.huggingface_repo_id = repo_id
+    model_file.base_model = base
+    return model_file
+
+
+@pytest.mark.asyncio
+async def test_list_adapters_slow_remote_degrades_to_local(monkeypatch):
+    # A poor network stalls the remote calls; local results must not wait on them.
+    monkeypatch.setattr(discovery, "REMOTE_ADAPTER_DISCOVERY_BUDGET", 0.2)
+
+    async def slow_remote(*args, **kwargs):
+        await asyncio.sleep(5)
+        return []
+
+    monkeypatch.setattr(discovery, "_cached_hf_adapters", slow_remote)
+    monkeypatch.setattr(discovery, "_cached_ms_adapters", slow_remote)
+
+    session = _adapters_session([_local_lora("org/my-lora")])
+
+    start = time.monotonic()
+    result = await discovery.list_adapters_for_base(session, "Qwen/Qwen3-8B", q="lora")
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 2.0
+    names = [item["lora_repo_name"] for item in result["lora_list"]]
+    assert names == ["org/my-lora"]
+
+
+@pytest.mark.asyncio
+async def test_list_adapters_remote_exception_degrades_to_local(monkeypatch):
+    async def boom(*args, **kwargs):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(discovery, "_cached_hf_adapters", boom)
+    monkeypatch.setattr(discovery, "_cached_ms_adapters", boom)
+
+    session = _adapters_session([_local_lora("org/my-lora")])
+
+    result = await discovery.list_adapters_for_base(session, "Qwen/Qwen3-8B", q="lora")
+
+    names = [item["lora_repo_name"] for item in result["lora_list"]]
+    assert names == ["org/my-lora"]
+
+
+@pytest.mark.asyncio
+async def test_list_adapters_merges_remote_with_local(monkeypatch):
+    async def hf(*args, **kwargs):
+        return [
+            {
+                "lora_repo_name": "remote/hf-lora",
+                "source": SourceEnum.HUGGING_FACE.value,
+                "is_local": False,
+            }
+        ]
+
+    async def empty(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(discovery, "_cached_hf_adapters", hf)
+    monkeypatch.setattr(discovery, "_cached_ms_adapters", empty)
+
+    session = _adapters_session([_local_lora("org/my-lora")])
+
+    result = await discovery.list_adapters_for_base(session, "Qwen/Qwen3-8B", q="lora")
+
+    names = [item["lora_repo_name"] for item in result["lora_list"]]
+    # Local first, then remote.
+    assert names == ["org/my-lora", "remote/hf-lora"]
+
+
+@pytest.mark.asyncio
+async def test_list_adapters_no_query_skips_remote(monkeypatch):
+    # No q: local only, remote must not be called.
+    calls = {"hf": 0, "ms": 0}
+
+    async def track_hf(*args, **kwargs):
+        calls["hf"] += 1
+        return []
+
+    async def track_ms(*args, **kwargs):
+        calls["ms"] += 1
+        return []
+
+    monkeypatch.setattr(discovery, "_cached_hf_adapters", track_hf)
+    monkeypatch.setattr(discovery, "_cached_ms_adapters", track_ms)
+
+    session = _adapters_session([_local_lora("org/my-lora")])
+
+    result = await discovery.list_adapters_for_base(session, "Qwen/Qwen3-8B")
+
+    names = [item["lora_repo_name"] for item in result["lora_list"]]
+    assert names == ["org/my-lora"]
+    assert calls == {"hf": 0, "ms": 0}
+
+
+@pytest.mark.asyncio
+async def test_list_local_loras_filters_by_q():
+    # q filters local by lora_repo_name, case-insensitive.
+    session = _adapters_session(
+        [_local_lora("org/chat-lora"), _local_lora("org/math-lora")]
+    )
+
+    result = await discovery.list_local_loras(session, "Qwen/Qwen3-8B", q="CHAT")
+
+    names = [item["lora_repo_name"] for item in result]
+    assert names == ["org/chat-lora"]
