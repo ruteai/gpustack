@@ -37,6 +37,7 @@ from gpustack.gateway.utils import (
     gpustack_ai_proxy_name,
     gpustack_model_mapper_name,
     gpustack_generic_proxy_router_name,
+    gpustack_max_completion_tokens_name,
     mcp_ingress_equal,
     get_default_mcpbridge_ref,
     ensure_wasm_plugin,
@@ -528,6 +529,23 @@ def transformer_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
     return resource_name, expected_spec
 
 
+def max_completion_tokens_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
+    resource_name = gpustack_max_completion_tokens_name
+    expected_spec = WasmPluginSpec(
+        defaultConfig={},
+        defaultConfigDisable=True,
+        failStrategy="FAIL_OPEN",
+        imagePullPolicy="UNSPECIFIED_POLICY",
+        matchRules=[],
+        phase="AUTHN",
+        priority=820,
+        url=get_plugin_url_with_name_and_version(
+            name="transformer", version="2.0.0", cfg=cfg
+        ),
+    )
+    return resource_name, expected_spec
+
+
 def generic_proxy_router_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
     """
     Generic-proxy router. Operates in two complementary modes per request and
@@ -839,6 +857,7 @@ def initialize_gateway(cfg: Config, timeout: int = 60, interval: int = 5):
         if cfg.server_role() != Config.ServerRole.WORKER:
             plugin_list.append(transformer_plugin(cfg=cfg))
             plugin_list.append(token_usage_plugin(cfg=cfg))
+            plugin_list.append(max_completion_tokens_plugin(cfg=cfg))
 
         async def prepare():
             api_client = k8s_client.ApiClient(
