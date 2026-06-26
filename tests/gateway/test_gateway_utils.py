@@ -12,6 +12,7 @@ from gpustack.gateway.utils import (
     generic_proxy_router_diff_spec,
     get_instance_id_from_header,
     lora_registry_name_suffix,
+    max_completion_tokens_match_rule,
     model_instance_registry,
     model_instances_registry_list,
     provider_registry,
@@ -24,6 +25,7 @@ from gpustack.schemas.model_provider import (
     ModelProviderTypeEnum,
     OpenAIConfig,
     OllamaConfig,
+    requires_max_completion_tokens,
 )
 from gpustack.gateway.client.networking_higress_io_v1_api import McpBridgeRegistry
 
@@ -498,6 +500,34 @@ def test_get_instance_id_from_header_invalid():
         get_instance_id_from_header({})
     with pytest.raises(NotFoundException):
         get_instance_id_from_header({router_header_key: "cluster-gateway.static"})
+
+
+def test_requires_max_completion_tokens():
+    assert requires_max_completion_tokens("gpt-5") is True
+    assert requires_max_completion_tokens("gpt-5.5") is True
+    assert requires_max_completion_tokens("openai/gpt-5") is True
+    assert requires_max_completion_tokens("o1-mini") is True
+    assert requires_max_completion_tokens("o3") is True
+    assert requires_max_completion_tokens("o4") is True
+    assert requires_max_completion_tokens("gpt-4o") is False
+    assert requires_max_completion_tokens("gpt-3.5-turbo") is False
+    assert requires_max_completion_tokens("deepseek-r1") is False
+    assert requires_max_completion_tokens("") is False
+    assert requires_max_completion_tokens("Qwen") is False
+
+
+def test_max_completion_tokens_match_rule():
+    rule = max_completion_tokens_match_rule("ns/ai-route-route-42.internal")
+    assert rule.config == {
+        "reqRules": [
+            {
+                "operate": "rename",
+                "body": [{"oldKey": "max_tokens", "newKey": "max_completion_tokens"}],
+            }
+        ]
+    }
+    assert rule.configDisable is False
+    assert rule.ingress == ["ns/ai-route-route-42.internal"]
 
 
 def test_model_instances_registry_list_threads_suffix():

@@ -619,6 +619,14 @@ class ModelProviderListParams(ListParams):
     ]
 
 
+GPT5_REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
+
+def requires_max_completion_tokens(model_name: str) -> bool:
+    name = (model_name or "").lower().rsplit("/", 1)[-1]
+    return name.startswith(GPT5_REASONING_PREFIXES)
+
+
 class ProviderModelsInput(BaseModel):
     api_token: Optional[str] = None
     config: Optional[ProviderConfigType] = None

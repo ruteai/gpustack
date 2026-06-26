@@ -97,6 +97,7 @@ from gpustack.gateway.utils import (
     cleanup_fallback_filters,
     cleanup_ai_proxy_config,
     cleanup_generic_proxy_router,
+    cleanup_max_completion_tokens,
     cleanup_mcpbridge_registry,
     resolve_instance_address_from_model_header,
 )
@@ -1024,6 +1025,11 @@ class Server:
             routes=model_routes,
             k8s_config=k8s_config,
             namespace=self.config.gateway_namespace,
+        )
+        await cleanup_max_completion_tokens(
+            namespace=self.config.gateway_namespace,
+            expected_ingresses=expected_ingress_names,
+            config=k8s_config,
         )
         await cleanup_mcpbridge_registry(
             providers=providers,

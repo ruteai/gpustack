@@ -156,6 +156,8 @@ from gpustack.gateway import utils as mcp_handler
 from gpustack.gateway import get_async_k8s_config
 from gpustack.schemas.model_provider import (
     ModelProvider,
+    ModelProviderTypeEnum,
+    requires_max_completion_tokens,
 )
 
 logger = logging.getLogger(__name__)
@@ -1032,6 +1034,85 @@ async def ensure_route_ai_proxy_config(
     )
 
 
+async def ensure_route_max_completion_tokens_transform(
+    cfg: Config,
+    session: AsyncSession,
+    model_route_id: int,
+    extensions_api: ExtensionsHigressIoV1Api,
+    route_targets: List[ModelRouteTarget],
+    event_type: EventType,
+):
+    service_namespace_prefix = cfg.get_namespace() + "/"
+    if cfg.get_namespace() == cfg.gateway_namespace:
+        service_namespace_prefix = ""
+    ingress_name = mcp_handler.model_route_ingress_name(model_route_id)
+    fallback_ingress_name = mcp_handler.fallback_ingress_name(ingress_name)
+    full_ingress_name = f"{service_namespace_prefix}{ingress_name}"
+    full_fallback_ingress_name = f"{service_namespace_prefix}{fallback_ingress_name}"
+
+    provider_targets = [t for t in route_targets if t.provider_id is not None]
+    needs_transform = False
+    if provider_targets and event_type != EventType.DELETED:
+        all_qualify = True
+        for target in provider_targets:
+            provider = await ModelProvider.one_by_id(
+                session=session, id=target.provider_id
+            )
+            if provider is None:
+                all_qualify = False
+                break
+            provider_type = getattr(getattr(provider, "config", None), "type", None)
+            if provider_type not in (
+                ModelProviderTypeEnum.OPENAI,
+                ModelProviderTypeEnum.AZURE,
+            ):
+                all_qualify = False
+                break
+            if not requires_max_completion_tokens(target.overridden_model_name):
+                all_qualify = False
+                break
+        needs_transform = all_qualify
+
+    expected_rules = []
+    if needs_transform:
+        expected_rules.append(
+            mcp_handler.max_completion_tokens_match_rule(full_ingress_name)
+        )
+        has_fallback = any(
+            target
+            for target in route_targets
+            if target.fallback_status_codes and len(target.fallback_status_codes) > 0
+        )
+        if has_fallback:
+            expected_rules.append(
+                mcp_handler.max_completion_tokens_match_rule(full_fallback_ingress_name)
+            )
+
+    def spec_diff(
+        current_spec: Optional[WasmPluginSpec],
+    ) -> Optional[WasmPluginSpec]:
+        if current_spec is None:
+            return current_spec
+        to_keep_rules: List[WasmPluginMatchRule] = []
+        for rule in current_spec.matchRules or []:
+            if any(
+                ingress not in (full_ingress_name, full_fallback_ingress_name)
+                for ingress in (rule.ingress or [])
+            ):
+                to_keep_rules.append(rule)
+        to_keep_rules.extend(expected_rules)
+        to_keep_rules.sort(key=lambda r: (r.ingress[0] if r.ingress else ""))
+        current_spec.matchRules = to_keep_rules
+        return current_spec
+
+    await mcp_handler.ensure_wasm_plugin(
+        api=extensions_api,
+        name=mcp_handler.gpustack_max_completion_tokens_name,
+        namespace=cfg.gateway_namespace,
+        spec_diff=spec_diff,
+    )
+
+
 async def sync_gateway(
     session: AsyncSession,
     event: Event,
@@ -1140,6 +1221,15 @@ async def sync_gateway(
         extensions_api=extensions_api,
         route_destinations=destinations,
         fallback_destinations=fallback_destinations,
+    )
+    # ensure max_completion_tokens rename for gpt-5/o-series external provider routes
+    await ensure_route_max_completion_tokens_transform(
+        cfg=cfg,
+        session=session,
+        model_route_id=model_route.id,
+        extensions_api=extensions_api,
+        route_targets=targets,
+        event_type=event_type,
     )
 
 

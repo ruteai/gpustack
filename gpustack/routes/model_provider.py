@@ -8,19 +8,20 @@ from sqlalchemy.orm import selectinload
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from gpustack.schemas.model_provider import (
-    MaskedAPIToken,
     ModelProvider,
     ModelProviderCreate,
+    ModelProviderTypeEnum,
     ModelProviderUpdate,
     ModelProviderPublic,
-    ModelProvidersPublic,
     ModelProviderListParams,
+    ModelProvidersPublic,
+    MaskedAPIToken,
+    OpenAIConfig,
+    ProviderModel,
     ProviderModelsInput,
-    ModelProviderTypeEnum,
     TestProviderModelInput,
     TestProviderModelResult,
-    ProviderModel,
-    OpenAIConfig,
+    requires_max_completion_tokens,
 )
 from gpustack.schemas.models import CategoryEnum
 from gpustack.schemas.model_routes import ModelRouteTarget
@@ -441,10 +442,9 @@ async def get_models_from_specific_provider(
 
 
 def _get_model_output_token_dict(model_name: str) -> Dict[str, Any]:
-    name = model_name.lower().rsplit("/", 1)[-1]
     max_token_key = (
         "max_completion_tokens"
-        if name.startswith(("gpt-5", "o1", "o3", "o4"))
+        if requires_max_completion_tokens(model_name)
         else "max_tokens"
     )
     return {max_token_key: 16}
