@@ -69,6 +69,7 @@ default_mcp_bridge_name = "default"
 gpustack_ai_proxy_name = "gpustack-ai-proxy"
 gpustack_model_mapper_name = "gpustack-model-mapper"
 gpustack_generic_proxy_router_name = "gpustack-model-router"
+gpustack_max_completion_tokens_name = "gpustack-max-completion-tokens"
 model_ingress_prefix = "ai-route-model-"
 model_route_ingress_prefix = "ai-route-route-"
 provider_id_prefix = "provider-"
@@ -970,6 +971,58 @@ async def ensure_wasm_plugin(
                 body=current_plugin,
             )
             logger.info(f"Updated WasmPlugin {name} in namespace {namespace}.")
+
+
+def max_completion_tokens_match_rule(ingress_full_name: str) -> WasmPluginMatchRule:
+    return WasmPluginMatchRule(
+        config={
+            "reqRules": [
+                {
+                    "operate": "rename",
+                    "body": [
+                        {"oldKey": "max_tokens", "newKey": "max_completion_tokens"}
+                    ],
+                }
+            ]
+        },
+        configDisable=False,
+        ingress=[ingress_full_name],
+    )
+
+
+async def cleanup_max_completion_tokens(
+    namespace: str,
+    expected_ingresses: List[str],
+    config: k8s_client.Configuration,
+    extra_labels: Optional[Dict[str, str]] = None,
+):
+    api = ExtensionsHigressIoV1Api(k8s_client.ApiClient(config))
+    labels = copy.deepcopy(managed_labels)
+    if extra_labels:
+        labels.update(extra_labels)
+
+    def spec_diff(current_spec: Optional[WasmPluginSpec]) -> WasmPluginSpec:
+        if current_spec is None:
+            return current_spec
+        to_keep_rules: List[WasmPluginMatchRule] = []
+        for rule in current_spec.matchRules or []:
+            if any(ingress in expected_ingresses for ingress in rule.ingress):
+                to_keep_rules.append(rule)
+            else:
+                logger.info(
+                    f"Removing rule with ingress {rule.ingress} from max_completion_tokens plugin as it is not in expected ingresses."
+                )
+        to_keep_rules.sort(key=lambda r: r.ingress[0] if r.ingress else "")
+        current_spec.matchRules = to_keep_rules
+        return current_spec
+
+    await ensure_wasm_plugin(
+        api=api,
+        name=gpustack_max_completion_tokens_name,
+        namespace=namespace,
+        spec_diff=spec_diff,
+        extra_labels=extra_labels,
+    )
 
 
 async def cleanup_model_mapper(
