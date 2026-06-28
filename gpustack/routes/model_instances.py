@@ -99,9 +99,13 @@ async def get_model_instances(
     id: Optional[int] = None,
     model_id: Optional[int] = None,
     worker_id: Optional[int] = None,
+    cluster_id: Optional[int] = None,
     state: Optional[str] = None,
+    search: Optional[str] = None,
 ):
     fields = {}
+    search = search.strip() if search else None
+    fuzzy_fields = {"name": search} if search else {}
     if id:
         fields["id"] = id
 
@@ -110,6 +114,9 @@ async def get_model_instances(
 
     if worker_id:
         fields["worker_id"] = worker_id
+
+    if cluster_id:
+        fields["cluster_id"] = cluster_id
 
     if state:
         fields["state"] = state
@@ -131,7 +138,11 @@ async def get_model_instances(
             else None
         )
         return StreamingResponse(
-            ModelInstance.streaming(fields=fields, filter_func=filter_func),
+            ModelInstance.streaming(
+                fields=fields,
+                fuzzy_fields=fuzzy_fields,
+                filter_func=filter_func,
+            ),
             media_type="text/event-stream",
         )
 
@@ -140,6 +151,7 @@ async def get_model_instances(
         return await ModelInstance.paginated_by_query(
             session=session,
             fields=fields,
+            fuzzy_fields=fuzzy_fields,
             extra_conditions=extra_conditions,
             page=params.page,
             per_page=params.perPage,
